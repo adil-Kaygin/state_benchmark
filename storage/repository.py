@@ -19,7 +19,7 @@ class ExperimentRepository:
         random_seed: int,  
         status: str,  
     ) -> None:  
-        timestamp = datetime.datetime.utcnow().isoformat()  
+        timestamp = datetime.datetime.now(datetime.UTC).isoformat()
         self._db.execute(  
             """  
             INSERT INTO experiments (id, timestamp, benchmark_name, estimator_name, random_seed, status)  

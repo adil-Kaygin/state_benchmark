@@ -13,15 +13,17 @@ from datasets.schema import TrajectoryDataset
   
 class ParticleFilterEstimator(BaseEstimator):  
   
-    def __init__(  
-        self,  
-        filter_model: FilterModel,  
-        num_particles: int = 1000,  
-        resample_threshold: float = 0.5,  
-    ) -> None:  
-        self._model = filter_model  
-        self._num_particles = num_particles  
-        self._resample_threshold = resample_threshold  
+    def __init__(
+        self,
+        filter_model: FilterModel,
+        num_particles: int = 1000,
+        resample_threshold: float = 0.5,
+        random_seed: int = 0,
+    ) -> None:
+        self._model = filter_model
+        self._num_particles = num_particles
+        self._resample_threshold = resample_threshold
+        self._random_seed = random_seed
   
     @property  
     def estimator_name(self) -> str:  
@@ -51,8 +53,8 @@ class ParticleFilterEstimator(BaseEstimator):
         x0_cov = self._model.x0_cov if self._model.x0_cov is not None else np.eye(nx)
 
         estimates = np.zeros((N, T, nx))
-  
-        rng = np.random.default_rng()  
+
+        rng = np.random.default_rng(self._random_seed)
   
         for i in range(N):  
             particles = rng.multivariate_normal(x0_mean, x0_cov, size=M)
@@ -87,12 +89,13 @@ class ParticleFilterEstimator(BaseEstimator):
         path.parent.mkdir(parents=True, exist_ok=True)  
         with open(path, "w") as f:  
             json.dump(  
-                {  
-                    "estimator_name": self.estimator_name,  
-                    "estimator_type": self.estimator_type,  
-                    "num_particles": self._num_particles,  
-                    "resample_threshold": self._resample_threshold,  
-                },  
+                {
+                    "estimator_name": self.estimator_name,
+                    "estimator_type": self.estimator_type,
+                    "num_particles": self._num_particles,
+                    "resample_threshold": self._resample_threshold,
+                    "random_seed": self._random_seed,
+                },
                 f,  
             )  
   

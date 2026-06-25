@@ -9,7 +9,7 @@ import numpy as np
 from ..base import BaseEstimator
 from benchmark_levels.base import FilterModel
 from datasets.schema import TrajectoryDataset
-from ._numba_kernels import kf_loop_batch
+from ._numba_kernels import kf_loop_batch, assert_linear_model
 
 
 class KalmanFilterEstimator(BaseEstimator):
@@ -44,7 +44,11 @@ class KalmanFilterEstimator(BaseEstimator):
         F = self._model.F(np.zeros(nx))
         H = self._model.H(np.zeros(nx))
 
+        x0_mean = self._model.x0_mean if self._model.x0_mean is not None else np.zeros(nx)
+        x0_cov = self._model.x0_cov if self._model.x0_cov is not None else np.eye(nx)
+
         if self._use_numba:
+            assert_linear_model(self._model.f, self._model.h, F, H, nx, ny)
             obs64 = np.ascontiguousarray(observations, dtype=np.float64)
             return kf_loop_batch(
                 np.ascontiguousarray(F, dtype=np.float64),
@@ -52,12 +56,11 @@ class KalmanFilterEstimator(BaseEstimator):
                 np.ascontiguousarray(Q, dtype=np.float64),
                 np.ascontiguousarray(R, dtype=np.float64),
                 obs64,
+                np.ascontiguousarray(x0_mean, dtype=np.float64),
+                np.ascontiguousarray(x0_cov, dtype=np.float64),
             )
 
         estimates = np.zeros((N, T, nx))
-
-        x0_mean = self._model.x0_mean if self._model.x0_mean is not None else np.zeros(nx)
-        x0_cov = self._model.x0_cov if self._model.x0_cov is not None else np.eye(nx)
 
         for i in range(N):
             x = x0_mean.copy()

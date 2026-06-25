@@ -117,7 +117,7 @@ class PendulumBenchmark(BenchmarkLevel):
                 trajectory_length=self._trajectory_length,  
                 num_trajectories=n_traj,  
                 random_seed=self._random_seed,  
-                generation_time=datetime.datetime.utcnow().isoformat(),  
+                generation_time=datetime.datetime.now(datetime.UTC).isoformat(),
             )  
             HDF5Writer(output_dir / f"{split_name}.h5").write(  
                 states, observations, timestamps, metadata  

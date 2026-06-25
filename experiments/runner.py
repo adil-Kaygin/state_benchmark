@@ -7,13 +7,14 @@ from typing import Optional
   
 import numpy as np  
   
-from .config import ExperimentConfig  
-from .result import ExperimentResult  
-from estimators.base import BaseEstimator  
-from datasets.schema import TrajectoryDataset  
-from metrics.rmse import compute_rmse  
-from metrics.memory import measure_memory  
-from storage.repository import ExperimentRepository  
+from .config import ExperimentConfig
+from .result import ExperimentResult
+from estimators.base import BaseEstimator
+from datasets.schema import TrajectoryDataset
+from metrics.rmse import compute_rmse
+from metrics.memory import measure_memory
+from metrics.runtime import runtime_per_step_ms as _runtime_per_step_ms
+from storage.repository import ExperimentRepository
   
   
 def _to_numpy(arr) -> np.ndarray:  
@@ -57,9 +58,9 @@ class ExperimentRunner:
             estimates = estimator.estimate(test_dataset)  
             runtime_seconds = time.perf_counter() - t0  
   
-            N = int(_to_numpy(test_dataset.states).shape[0])  
-            T = int(_to_numpy(test_dataset.timestamps).shape[0])  
-            runtime_per_step_ms = (runtime_seconds / (N * T)) * 1000.0  
+            N = int(_to_numpy(test_dataset.states).shape[0])
+            T = int(_to_numpy(test_dataset.timestamps).shape[0])
+            runtime_per_step_ms = _runtime_per_step_ms(runtime_seconds, N * T)
   
             estimates_np = _to_numpy(estimates)  
             targets_np = _to_numpy(test_dataset.states)  

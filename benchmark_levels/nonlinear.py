@@ -102,7 +102,7 @@ class NonlinearBenchmark(BenchmarkLevel):
                 trajectory_length=self._trajectory_length,  
                 num_trajectories=n_traj,  
                 random_seed=self._random_seed,  
-                generation_time=datetime.datetime.utcnow().isoformat(),  
+                generation_time=datetime.datetime.now(datetime.UTC).isoformat(),
             )  
             HDF5Writer(output_dir / f"{split_name}.h5").write(  
                 states, observations, timestamps, metadata  
@@ -125,7 +125,8 @@ class NonlinearBenchmark(BenchmarkLevel):
         def H_jac(x: np.ndarray) -> np.ndarray:  
             return np.array([[x[0] / 10.0]])  
   
-        return FilterModel(  
-            f=f, h=h, F=F_jac, H=H_jac,  
-            Q=self._Q.copy(), R=self._R.copy(),  
+        return FilterModel(
+            f=f, h=h, F=F_jac, H=H_jac,
+            Q=self._Q.copy(), R=self._R.copy(),
+            x0_mean=np.zeros(1), x0_cov=np.eye(1),
         )

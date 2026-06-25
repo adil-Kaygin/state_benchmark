@@ -29,6 +29,29 @@ except ImportError:
         return _decorator
 
 
+def assert_linear_model(f, h, F: np.ndarray, H: np.ndarray, nx: int, ny: int) -> None:
+    """Raise ValueError unless f(x)=Fx and h(x)=Hx on a probe vector.
+
+    kf_loop_batch/ukf_linear_loop hardcode the f(x)=Fx, h(x)=Hx assumption for
+    speed; silently enabling use_numba=True on a nonlinear FilterModel (e.g.
+    pendulum/lorenz/nonlinear) would linearize at the origin instead of
+    erroring, producing numbers that look like KF/UKF results but aren't.
+    """
+    rng = np.random.default_rng(0)
+    x_probe = rng.standard_normal(nx)
+    f_actual = np.asarray(f(x_probe))
+    f_linear = F @ x_probe
+    h_actual = np.asarray(h(x_probe))
+    h_linear = H @ x_probe
+    if not (np.allclose(f_actual, f_linear, atol=1e-8) and np.allclose(h_actual, h_linear, atol=1e-8)):
+        raise ValueError(
+            "use_numba=True requires f(x)=F@x and h(x)=H@x (e.g. LinearBenchmark); "
+            "this FilterModel's f/h are nonlinear, so the fast numba path would "
+            "silently linearize at the origin instead of running the real filter. "
+            "Set use_numba=False for this benchmark."
+        )
+
+
 @njit(cache=True, fastmath=True)
 def kf_loop(
     F: np.ndarray,
@@ -36,14 +59,22 @@ def kf_loop(
     Q: np.ndarray,
     R: np.ndarray,
     observations: np.ndarray,  # [T, ny]
+    x0: np.ndarray,  # [nx]
+    P0: np.ndarray,  # [nx, nx]
 ) -> np.ndarray:
-    """Linear Kalman filter over a single trajectory. Returns estimates [T, nx]."""
+    """Linear Kalman filter over a single trajectory. Returns estimates [T, nx].
+
+    x0/P0 must be the benchmark's generative prior (FilterModel.x0_mean/x0_cov),
+    not a hardcoded zeros/identity default -- otherwise this diverges from the
+    pure-NumPy/EKF paths, which do use the real prior, and KF/EKF/UKF stop being
+    a fair comparison on the same dataset.
+    """
     T, ny = observations.shape
     nx = Q.shape[0]
     estimates = np.zeros((T, nx))
 
-    x = np.zeros(nx)
-    P = np.eye(nx)
+    x = x0.copy()
+    P = P0.copy()
     I = np.eye(nx)
     Ht = H.T
 
@@ -68,13 +99,15 @@ def kf_loop_batch(
     Q: np.ndarray,
     R: np.ndarray,
     observations: np.ndarray,  # [N, T, ny]
+    x0: np.ndarray,  # [nx]
+    P0: np.ndarray,  # [nx, nx]
 ) -> np.ndarray:
     N = observations.shape[0]
     T, ny = observations.shape[1], observations.shape[2]
     nx = Q.shape[0]
     estimates = np.zeros((N, T, nx))
     for i in range(N):
-        estimates[i] = kf_loop(F, H, Q, R, observations[i])
+        estimates[i] = kf_loop(F, H, Q, R, observations[i], x0, P0)
     return estimates
 
 
@@ -114,10 +147,17 @@ def ukf_linear_loop(
     alpha: float,
     beta: float,
     kappa: float,
+    x0: np.ndarray,  # [nx]
+    P0: np.ndarray,  # [nx, nx]
 ) -> np.ndarray:
     """Fast UKF path for benchmarks whose f/h are linear (f(x)=Fx, h(x)=Hx),
     e.g. LinearBenchmark. Runs the full sigma-point machinery under njit
-    since F/H are constant matrices rather than arbitrary Python callables."""
+    since F/H are constant matrices rather than arbitrary Python callables.
+
+    x0/P0 must be the benchmark's generative prior -- see kf_loop's docstring
+    for why a hardcoded zeros/identity default would make this path diverge
+    from the pure-NumPy UKF/EKF on the same dataset.
+    """
     T, ny = observations.shape
     nx = Q.shape[0]
     n_sig = 2 * nx + 1
@@ -133,8 +173,8 @@ def ukf_linear_loop(
         Wc[i] = 1.0 / (2.0 * c)
 
     estimates = np.zeros((T, nx))
-    x = np.zeros(nx)
-    P = np.eye(nx)
+    x = x0.copy()
+    P = P0.copy()
 
     for t in range(T):
         sqrtP = np.linalg.cholesky(c * P)

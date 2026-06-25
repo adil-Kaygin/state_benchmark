@@ -9,7 +9,7 @@ import numpy as np
 from ..base import BaseEstimator
 from benchmark_levels.base import FilterModel
 from datasets.schema import TrajectoryDataset
-from ._numba_kernels import ukf_linear_loop
+from ._numba_kernels import ukf_linear_loop, assert_linear_model
 
 
 class UKFEstimator(BaseEstimator):
@@ -79,24 +79,27 @@ class UKFEstimator(BaseEstimator):
         Q = self._model.Q
         R = self._model.R
 
+        x0_mean = self._model.x0_mean if self._model.x0_mean is not None else np.zeros(nx)
+        x0_cov = self._model.x0_cov if self._model.x0_cov is not None else np.eye(nx)
+
         if self._use_numba:
             F = np.ascontiguousarray(self._model.F(np.zeros(nx)), dtype=np.float64)
             H = np.ascontiguousarray(self._model.H(np.zeros(nx)), dtype=np.float64)
+            assert_linear_model(self._model.f, self._model.h, F, H, nx, ny)
             Q64 = np.ascontiguousarray(Q, dtype=np.float64)
             R64 = np.ascontiguousarray(R, dtype=np.float64)
+            x064 = np.ascontiguousarray(x0_mean, dtype=np.float64)
+            P064 = np.ascontiguousarray(x0_cov, dtype=np.float64)
             estimates = np.zeros((N, T, nx))
             for i in range(N):
                 obs64 = np.ascontiguousarray(observations[i], dtype=np.float64)
                 estimates[i] = ukf_linear_loop(
-                    F, H, Q64, R64, obs64, self._alpha, self._beta, self._kappa
+                    F, H, Q64, R64, obs64, self._alpha, self._beta, self._kappa, x064, P064
                 )
             return estimates
 
         timestamps = np.asarray(dataset.timestamps)
         estimates = np.zeros((N, T, nx))
-
-        x0_mean = self._model.x0_mean if self._model.x0_mean is not None else np.zeros(nx)
-        x0_cov = self._model.x0_cov if self._model.x0_cov is not None else np.eye(nx)
 
         for i in range(N):
             x = x0_mean.copy()
