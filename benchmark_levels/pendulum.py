@@ -52,8 +52,8 @@ class PendulumBenchmark(BenchmarkLevel):
         dt: float = 0.05,
         g: float = 9.81,
         length: float = 1.0,
-        process_noise_std: float = 0.001,
-        observation_noise_std: float = 0.01,
+        process_noise_var: float = 0.001,
+        observation_noise_var: float = 0.01,
         initial_angle_range: float = np.pi / 4,
     ) -> None:
         self._trajectory_length = trajectory_length
@@ -63,8 +63,8 @@ class PendulumBenchmark(BenchmarkLevel):
         self._g = g
         self._length = length
         self._initial_angle_range = initial_angle_range
-        self._Q = np.eye(2) * process_noise_std
-        self._R = np.eye(1) * observation_noise_std
+        self._Q = np.eye(2) * process_noise_var
+        self._R = np.eye(1) * observation_noise_var
   
     @property  
     def name(self) -> str:  
@@ -128,7 +128,7 @@ class PendulumBenchmark(BenchmarkLevel):
         length = self._length  
         dt = self._dt  
   
-        def f(x: np.ndarray) -> np.ndarray:  
+        def f(x: np.ndarray, t: float = 0.0) -> np.ndarray:  
             theta, omega = x  
             alpha = -(g / length) * np.sin(theta)  
             return np.array([theta + omega * dt, omega + alpha * dt])  
@@ -146,7 +146,11 @@ class PendulumBenchmark(BenchmarkLevel):
         def H_jac(x: np.ndarray) -> np.ndarray:  
             return np.array([[1.0, 0.0]])  
   
+        theta_var = (self._initial_angle_range ** 2) / 3.0
+        x0_cov = np.diag([theta_var, 1e-6])
+
         return FilterModel(  
             f=f, h=h, F=F_jac, H=H_jac,  
             Q=self._Q.copy(), R=self._R.copy(),  
+            x0_mean=np.zeros(2), x0_cov=x0_cov,  
         )

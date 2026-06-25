@@ -56,9 +56,12 @@ class KalmanFilterEstimator(BaseEstimator):
 
         estimates = np.zeros((N, T, nx))
 
+        x0_mean = self._model.x0_mean if self._model.x0_mean is not None else np.zeros(nx)
+        x0_cov = self._model.x0_cov if self._model.x0_cov is not None else np.eye(nx)
+
         for i in range(N):
-            x = np.zeros(nx)
-            P = np.eye(nx)
+            x = x0_mean.copy()
+            P = x0_cov.copy()
             for t in range(T):
                 x_pred = F @ x
                 P_pred = F @ P @ F.T + Q

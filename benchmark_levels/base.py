@@ -5,17 +5,19 @@ from dataclasses import dataclass
 from pathlib import Path  
 from typing import Callable, Optional  
   
-import numpy as np  
-  
-  
-@dataclass  
-class FilterModel:  
-    f: Callable  
-    h: Callable  
-    F: Optional[Callable]  
-    H: Optional[Callable]  
-    Q: np.ndarray  
-    R: np.ndarray  
+import numpy as np
+
+
+@dataclass
+class FilterModel:
+    f: Callable
+    h: Callable
+    F: Optional[Callable]
+    H: Optional[Callable]
+    Q: np.ndarray
+    R: np.ndarray
+    x0_mean: Optional[np.ndarray] = None
+    x0_cov: Optional[np.ndarray] = None
   
   
 class BaseSimulator(ABC):  

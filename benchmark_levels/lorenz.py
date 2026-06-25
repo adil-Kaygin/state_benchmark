@@ -139,12 +139,20 @@ class LorenzBenchmark(BenchmarkLevel):
         beta = self._beta  
         dt = self._dt  
   
-        def f(x: np.ndarray) -> np.ndarray:  
-            xv, y, z = x  
-            dxdt = sigma * (y - xv)  
-            dydt = xv * (rho - z) - y  
-            dzdt = xv * y - beta * z  
-            return x + dt * np.array([dxdt, dydt, dzdt])  
+        def _derivative(state: np.ndarray) -> np.ndarray:  
+            xv, y, z = state  
+            return np.array([  
+                sigma * (y - xv),  
+                xv * (rho - z) - y,  
+                xv * y - beta * z,  
+            ])  
+  
+        def f(x: np.ndarray, t: float = 0.0) -> np.ndarray:  
+            k1 = _derivative(x)  
+            k2 = _derivative(x + 0.5 * dt * k1)  
+            k3 = _derivative(x + 0.5 * dt * k2)  
+            k4 = _derivative(x + dt * k3)  
+            return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)  
   
         def h(x: np.ndarray) -> np.ndarray:  
             return np.array([x[0], x[1]])  
@@ -166,4 +174,5 @@ class LorenzBenchmark(BenchmarkLevel):
         return FilterModel(  
             f=f, h=h, F=F_jac, H=H_jac,  
             Q=self._Q.copy(), R=self._R.copy(),  
+            x0_mean=np.array([0.0, 0.0, 25.0]), x0_cov=np.eye(3),  
         )

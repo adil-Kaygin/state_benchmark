@@ -96,15 +96,15 @@ class _KalmanGainGRU:
         return _Module()
 
 
-def _process_model_step(f, x_batch: "torch.Tensor") -> "torch.Tensor":
+def _process_model_step(f, x_batch: "torch.Tensor", t: float = 0.0) -> "torch.Tensor":
     """Apply a benchmark's (possibly nonlinear, NumPy-based) process model
-    f(x) row-wise to a batch of state vectors on the CPU. KalmanNet's
+    f(x, t) row-wise to a batch of state vectors on the CPU. KalmanNet's
     predict step intentionally reuses the benchmark's own dynamics (matching
     the LLD's FilterModel contract) rather than learning them from scratch."""
     import torch
 
     x_np = x_batch.detach().cpu().numpy()
-    out = np.stack([f(x_np[i]) for i in range(x_np.shape[0])], axis=0)
+    out = np.stack([f(x_np[i], t) for i in range(x_np.shape[0])], axis=0)
     return torch.as_tensor(out, dtype=x_batch.dtype, device=x_batch.device)
 
 
@@ -182,7 +182,7 @@ class KalmanNetEstimator(BaseEstimator):
 
         estimates, log_vars = [], []
         for t in range(T):
-            x_pred = _process_model_step(self._model.f, x)
+            x_pred = _process_model_step(self._model.f, x, float(t))
             y_pred = _process_model_step(self._model.h, x_pred)
 
             innovation = observations[:, t, :] - y_pred

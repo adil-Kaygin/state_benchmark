@@ -92,38 +92,42 @@ class UKFEstimator(BaseEstimator):
                 )
             return estimates
 
+        timestamps = np.asarray(dataset.timestamps)
         estimates = np.zeros((N, T, nx))
-  
-        for i in range(N):  
-            x = np.zeros(nx)  
-            P = np.eye(nx)  
-  
-            for t in range(T):  
-                pts, Wm, Wc = self._sigma_points(x, P, nx)  
-  
-                pts_pred = np.array([self._model.f(sp) for sp in pts])  
-                x_pred = np.einsum("i,ij->j", Wm, pts_pred)  
-                P_pred = Q.copy()  
-                for j in range(2 * nx + 1):  
-                    d = pts_pred[j] - x_pred  
-                    P_pred += Wc[j] * np.outer(d, d)  
-  
-                pts_obs = np.array([self._model.h(sp) for sp in pts_pred])  
-                y_pred = np.einsum("i,ij->j", Wm, pts_obs)  
-                S = R.copy()  
-                Pxy = np.zeros((nx, ny))  
-                for j in range(2 * nx + 1):  
-                    d_obs = pts_obs[j] - y_pred  
-                    d_state = pts_pred[j] - x_pred  
-                    S += Wc[j] * np.outer(d_obs, d_obs)  
-                    Pxy += Wc[j] * np.outer(d_state, d_obs)  
-  
-                K = Pxy @ np.linalg.inv(S)  
-                x = x_pred + K @ (observations[i, t] - y_pred)  
-                P = P_pred - K @ S @ K.T  
-                estimates[i, t] = x  
-  
-        return estimates  
+
+        x0_mean = self._model.x0_mean if self._model.x0_mean is not None else np.zeros(nx)
+        x0_cov = self._model.x0_cov if self._model.x0_cov is not None else np.eye(nx)
+
+        for i in range(N):
+            x = x0_mean.copy()
+            P = x0_cov.copy()
+
+            for t in range(T):
+                pts, Wm, Wc = self._sigma_points(x, P, nx)
+
+                pts_pred = np.array([self._model.f(sp, float(timestamps[t])) for sp in pts])
+                x_pred = np.einsum("i,ij->j", Wm, pts_pred)
+                P_pred = Q.copy()
+                for j in range(2 * nx + 1):
+                    d = pts_pred[j] - x_pred
+                    P_pred += Wc[j] * np.outer(d, d)
+
+                pts_obs = np.array([self._model.h(sp) for sp in pts_pred])
+                y_pred = np.einsum("i,ij->j", Wm, pts_obs)
+                S = R.copy()
+                Pxy = np.zeros((nx, ny))
+                for j in range(2 * nx + 1):
+                    d_obs = pts_obs[j] - y_pred
+                    d_state = pts_pred[j] - x_pred
+                    S += Wc[j] * np.outer(d_obs, d_obs)
+                    Pxy += Wc[j] * np.outer(d_state, d_obs)
+
+                K = Pxy @ np.linalg.inv(S)
+                x = x_pred + K @ (observations[i, t] - y_pred)
+                P = P_pred - K @ S @ K.T
+                estimates[i, t] = x
+
+        return estimates
   
     def save(self, path: Path) -> None:  
         path.parent.mkdir(parents=True, exist_ok=True)  

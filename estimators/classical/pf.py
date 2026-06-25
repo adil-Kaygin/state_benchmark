@@ -38,27 +38,31 @@ class ParticleFilterEstimator(BaseEstimator):
     ) -> None:  
         pass  # PF requires no training.  
   
-    def estimate(self, dataset: TrajectoryDataset) -> np.ndarray:  
-        observations = np.asarray(dataset.observations)  
-        N, T, ny = observations.shape  
-        nx = self._model.Q.shape[0]  
-        M = self._num_particles  
-        Q = self._model.Q  
-        R_inv = np.linalg.inv(self._model.R)  
-  
-        estimates = np.zeros((N, T, nx))  
+    def estimate(self, dataset: TrajectoryDataset) -> np.ndarray:
+        observations = np.asarray(dataset.observations)
+        timestamps = np.asarray(dataset.timestamps)
+        N, T, ny = observations.shape
+        nx = self._model.Q.shape[0]
+        M = self._num_particles
+        Q = self._model.Q
+        R_inv = np.linalg.inv(self._model.R)
+
+        x0_mean = self._model.x0_mean if self._model.x0_mean is not None else np.zeros(nx)
+        x0_cov = self._model.x0_cov if self._model.x0_cov is not None else np.eye(nx)
+
+        estimates = np.zeros((N, T, nx))
   
         rng = np.random.default_rng()  
   
         for i in range(N):  
-            particles = rng.multivariate_normal(np.zeros(nx), np.eye(nx), size=M)  
+            particles = rng.multivariate_normal(x0_mean, x0_cov, size=M)
             weights = np.full(M, 1.0 / M)  
   
             for t in range(T):  
-                particles = np.array([  
-                    self._model.f(p) + rng.multivariate_normal(np.zeros(nx), Q)  
-                    for p in particles  
-                ])  
+                particles = np.array([
+                    self._model.f(p, float(timestamps[t])) + rng.multivariate_normal(np.zeros(nx), Q)
+                    for p in particles
+                ])
   
                 y = observations[i, t]  
                 log_w = np.array([  

@@ -47,20 +47,20 @@ class LinearBenchmark(BenchmarkLevel):
         num_trajectories: int = 500,
         random_seed: int = 42,
         dt: float = 0.1,
-        process_noise_std: float = 0.01,
-        observation_noise_std: float = 0.1,
-        initial_state_std: float = 1.0,
+        process_noise_var: float = 0.01,
+        observation_noise_var: float = 0.1,
+        initial_state_var: float = 1.0,
     ) -> None:
         self._trajectory_length = trajectory_length
         self._num_trajectories = num_trajectories
         self._random_seed = random_seed
         self._dt = dt
-        self._initial_state_std = initial_state_std
+        self._initial_state_var = initial_state_var
 
         self._F = np.array([[1.0, dt], [0.0, 1.0]])
         self._H = np.array([[1.0, 0.0]])
-        self._Q = np.eye(2) * process_noise_std
-        self._R = np.eye(1) * observation_noise_std
+        self._Q = np.eye(2) * process_noise_var
+        self._R = np.eye(1) * observation_noise_var
   
     @property  
     def name(self) -> str:  
@@ -98,7 +98,7 @@ class LinearBenchmark(BenchmarkLevel):
             timestamps = np.arange(self._trajectory_length, dtype=float) * self._dt  
   
             for i in range(n_traj):
-                x = rng.standard_normal(self.state_dimension) * self._initial_state_std
+                x = rng.standard_normal(self.state_dimension) * np.sqrt(self._initial_state_var)
                 for t in range(self._trajectory_length):  
                     states[i, t] = x  
                     observations[i, t] = simulator.observe(x)  
@@ -136,4 +136,5 @@ class LinearBenchmark(BenchmarkLevel):
         return FilterModel(  
             f=f, h=h, F=F_jac, H=H_jac,  
             Q=self._Q.copy(), R=self._R.copy(),  
+            x0_mean=np.zeros(2), x0_cov=np.eye(2) * self._initial_state_var,  
         )

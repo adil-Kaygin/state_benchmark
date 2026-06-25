@@ -42,26 +42,30 @@ class EKFEstimator(BaseEstimator):
         Q = self._model.Q  
         R = self._model.R  
   
-        estimates = np.zeros((N, T, nx))  
-  
-        for i in range(N):  
-            x = np.zeros(nx)  
-            P = np.eye(nx)  
-            for t in range(T):  
-                x_pred = self._model.f(x)  
-                F = self._model.F(x)  
-                P_pred = F @ P @ F.T + Q  
-  
-                H = self._model.H(x_pred)  
-                y_pred = self._model.h(x_pred)  
-                S = H @ P_pred @ H.T + R  
-                K = P_pred @ H.T @ np.linalg.inv(S)  
-  
-                x = x_pred + K @ (observations[i, t] - y_pred)  
-                P = (np.eye(nx) - K @ H) @ P_pred  
-                estimates[i, t] = x  
-  
-        return estimates  
+        timestamps = np.asarray(dataset.timestamps)
+        estimates = np.zeros((N, T, nx))
+
+        x0_mean = self._model.x0_mean if self._model.x0_mean is not None else np.zeros(nx)
+        x0_cov = self._model.x0_cov if self._model.x0_cov is not None else np.eye(nx)
+
+        for i in range(N):
+            x = x0_mean.copy()
+            P = x0_cov.copy()
+            for t in range(T):
+                x_pred = self._model.f(x, float(timestamps[t]))
+                F = self._model.F(x)
+                P_pred = F @ P @ F.T + Q
+
+                H = self._model.H(x_pred)
+                y_pred = self._model.h(x_pred)
+                S = H @ P_pred @ H.T + R
+                K = P_pred @ H.T @ np.linalg.inv(S)
+
+                x = x_pred + K @ (observations[i, t] - y_pred)
+                P = (np.eye(nx) - K @ H) @ P_pred
+                estimates[i, t] = x
+
+        return estimates
   
     def save(self, path: Path) -> None:  
         path.parent.mkdir(parents=True, exist_ok=True)  
