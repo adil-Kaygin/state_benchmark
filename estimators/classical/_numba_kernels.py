@@ -29,6 +29,27 @@ except ImportError:
         return _decorator
 
 
+@njit(cache=True, fastmath=True)
+def _robust_chol(M: np.ndarray, nx: int, I: np.ndarray) -> np.ndarray:
+    """Cholesky of a symmetric matrix that has drifted to (near-)singular.
+
+    Retries with an escalating diagonal jitter scaled to the magnitude of M
+    (via its mean diagonal) so a single fixed floor can't be too small for
+    large-magnitude states. Numba-friendly: plain loop + flag, no for/else.
+    """
+    scale = np.trace(M) / nx
+    if scale < 1.0:
+        scale = 1.0
+    jitter = 1e-9 * scale
+    for _ in range(12):
+        try:
+            return np.linalg.cholesky(M + jitter * I)
+        except Exception:
+            jitter *= 10.0
+    # Final attempt; let it raise if even this fails so the caller sees it.
+    return np.linalg.cholesky(M + jitter * I)
+
+
 def assert_linear_model(f, h, F: np.ndarray, H: np.ndarray, nx: int, ny: int) -> None:
     """Raise ValueError unless f(x)=Fx and h(x)=Hx on a probe vector.
 
@@ -214,14 +235,17 @@ def ukf_loop(
     estimates = np.zeros((T, nx))
     x = x0.copy()
     P = P0.copy()
-    jitter = 1e-9 * np.eye(nx)
+    I = np.eye(nx)
 
     for t in range(T):
-        # Cholesky can fail on a marginally non-PSD P; retry with jitter.
+        # Symmetrize and Cholesky; on failure, retry with an escalating jitter
+        # scaled to the magnitude of P so a fixed floor can't be too small.
+        P = 0.5 * (P + P.T)
+        M = c * P
         try:
-            sqrtP = np.linalg.cholesky(c * P)
+            sqrtP = np.linalg.cholesky(M)
         except Exception:
-            sqrtP = np.linalg.cholesky(c * (P + jitter))
+            sqrtP = _robust_chol(M, nx, I)
 
         sigmas = np.empty((n_sig, nx))
         sigmas[0] = x
@@ -261,6 +285,7 @@ def ukf_loop(
         K = Pxy @ np.linalg.inv(S)
         x = x_pred + K @ (observations[t] - y_pred)
         P = P_pred - K @ S @ K.T
+        P = 0.5 * (P + P.T)  # keep symmetric against numerical drift
         estimates[t] = x
 
     return estimates
@@ -354,9 +379,15 @@ def ukf_linear_loop(
     estimates = np.zeros((T, nx))
     x = x0.copy()
     P = P0.copy()
+    I = np.eye(nx)
 
     for t in range(T):
-        sqrtP = np.linalg.cholesky(c * P)
+        P = 0.5 * (P + P.T)
+        M = c * P
+        try:
+            sqrtP = np.linalg.cholesky(M)
+        except Exception:
+            sqrtP = _robust_chol(M, nx, I)
         sigmas = np.empty((n_sig, nx))
         sigmas[0] = x
         for i in range(nx):
@@ -376,7 +407,12 @@ def ukf_linear_loop(
             d = sig_f[i] - x_pred
             P_pred += Wc[i] * np.outer(d, d)
 
-        sqrtPp = np.linalg.cholesky(c * P_pred)
+        P_pred = 0.5 * (P_pred + P_pred.T)
+        Mp = c * P_pred
+        try:
+            sqrtPp = np.linalg.cholesky(Mp)
+        except Exception:
+            sqrtPp = _robust_chol(Mp, nx, I)
         sig2 = np.empty((n_sig, nx))
         sig2[0] = x_pred
         for i in range(nx):
@@ -403,6 +439,7 @@ def ukf_linear_loop(
         K = Pxy @ np.linalg.inv(S)
         x = x_pred + K @ (observations[t] - y_pred)
         P = P_pred - K @ S @ K.T
+        P = 0.5 * (P + P.T)  # keep symmetric against numerical drift
         estimates[t] = x
 
     return estimates

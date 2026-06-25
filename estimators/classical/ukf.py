@@ -48,12 +48,29 @@ class UKFEstimator(BaseEstimator):
         P: np.ndarray,  
         nx: int,  
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:  
-        lam = self._alpha ** 2 * (nx + self._kappa) - nx  
-  
-        try:  
-            L = np.linalg.cholesky((nx + lam) * P)  
-        except np.linalg.LinAlgError:  
-            L = np.linalg.cholesky((nx + lam) * (P + 1e-6 * np.eye(nx)))  
+        lam = self._alpha ** 2 * (nx + self._kappa) - nx
+
+        # Symmetrize to undo accumulated asymmetry from the Kalman update, then
+        # take the Cholesky. If P has drifted to (near-)singular, retry with an
+        # increasing diagonal jitter scaled to the magnitude of P so a single
+        # fixed 1e-6 floor can't be too small for large-magnitude states.
+        M = (nx + lam) * 0.5 * (P + P.T)
+        try:
+            L = np.linalg.cholesky(M)
+        except np.linalg.LinAlgError:
+            scale = max(1.0, float(np.trace(M)) / nx)
+            jitter = 1e-9 * scale
+            for _ in range(10):
+                try:
+                    L = np.linalg.cholesky(M + jitter * np.eye(nx))
+                    break
+                except np.linalg.LinAlgError:
+                    jitter *= 10.0
+            else:
+                # Last resort: eigenvalue clipping guarantees a PD matrix.
+                w, V = np.linalg.eigh(M)
+                w = np.clip(w, jitter, None)
+                L = np.linalg.cholesky((V * w) @ V.T)
   
         pts = np.zeros((2 * nx + 1, nx))  
         pts[0] = x  
@@ -129,6 +146,7 @@ class UKFEstimator(BaseEstimator):
                 K = Pxy @ np.linalg.inv(S)
                 x = x_pred + K @ (observations[i, t] - y_pred)
                 P = P_pred - K @ S @ K.T
+                P = 0.5 * (P + P.T)  # enforce symmetry against numerical drift
                 estimates[i, t] = x
 
         return estimates
