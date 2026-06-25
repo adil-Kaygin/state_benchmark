@@ -114,8 +114,8 @@ class NonlinearBenchmark(BenchmarkLevel):
             xv = x[0]  
             return np.array([0.5 * xv + 25.0 * xv / (1.0 + xv ** 2) + 8.0 * np.cos(1.2 * t)])  
   
-        def h(x: np.ndarray) -> np.ndarray:  
-            return np.array([x[0] ** 2 / 20.0])  
+        def h(x: np.ndarray, t: float = 0.0) -> np.ndarray:
+            return np.array([x[0] ** 2 / 20.0])
   
         def F_jac(x: np.ndarray) -> np.ndarray:  
             xv = x[0]  

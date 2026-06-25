@@ -154,8 +154,8 @@ class LorenzBenchmark(BenchmarkLevel):
             k4 = _derivative(x + dt * k3)  
             return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)  
   
-        def h(x: np.ndarray) -> np.ndarray:  
-            return np.array([x[0], x[1]])  
+        def h(x: np.ndarray, t: float = 0.0) -> np.ndarray:
+            return np.array([x[0], x[1]])
   
         def F_jac(x: np.ndarray) -> np.ndarray:  
             xv, y, z = x  

@@ -133,8 +133,8 @@ class PendulumBenchmark(BenchmarkLevel):
             alpha = -(g / length) * np.sin(theta)  
             return np.array([theta + omega * dt, omega + alpha * dt])  
   
-        def h(x: np.ndarray) -> np.ndarray:  
-            return np.array([x[0]])  
+        def h(x: np.ndarray, t: float = 0.0) -> np.ndarray:
+            return np.array([x[0]])
   
         def F_jac(x: np.ndarray) -> np.ndarray:  
             theta = x[0]  
