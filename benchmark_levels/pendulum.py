@@ -6,7 +6,8 @@ from typing import Optional
   
 import numpy as np  
   
-from .base import BenchmarkLevel, BaseSimulator, FilterModel  
+from .base import BenchmarkLevel, BaseSimulator, FilterModel
+from ._numba_dynamics import build_pendulum_numba_dynamics
   
   
 class PendulumSimulator(BaseSimulator):  
@@ -149,8 +150,9 @@ class PendulumBenchmark(BenchmarkLevel):
         theta_var = (self._initial_angle_range ** 2) / 3.0
         x0_cov = np.diag([theta_var, 1e-6])
 
-        return FilterModel(  
-            f=f, h=h, F=F_jac, H=H_jac,  
-            Q=self._Q.copy(), R=self._R.copy(),  
-            x0_mean=np.zeros(2), x0_cov=x0_cov,  
+        return FilterModel(
+            f=f, h=h, F=F_jac, H=H_jac,
+            Q=self._Q.copy(), R=self._R.copy(),
+            x0_mean=np.zeros(2), x0_cov=x0_cov,
+            numba=build_pendulum_numba_dynamics(g, length, dt),
         )

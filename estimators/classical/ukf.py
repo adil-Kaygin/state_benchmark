@@ -9,7 +9,7 @@ import numpy as np
 from ..base import BaseEstimator
 from benchmark_levels.base import FilterModel
 from datasets.schema import TrajectoryDataset
-from ._numba_kernels import ukf_linear_loop, assert_linear_model
+from ._numba_kernels import ukf_loop_batch
 
 
 class UKFEstimator(BaseEstimator):
@@ -20,15 +20,18 @@ class UKFEstimator(BaseEstimator):
         alpha: float = 1e-3,
         beta: float = 2.0,
         kappa: float = 0.0,
-        use_numba: bool = False,
+        use_numba: bool = True,
     ) -> None:
         self._model = filter_model
         self._alpha = alpha
         self._beta = beta
         self._kappa = kappa
-        # use_numba assumes f(x)=Fx and h(x)=Hx (true for LinearBenchmark).
-        # Leave False for nonlinear benchmarks (e.g. PendulumBenchmark) where
-        # f/h are arbitrary Python callables that numba cannot compile.
+        # use_numba dispatches the sigma-point recursion to the general @njit
+        # kernel (estimators/classical/_numba_kernels.py:ukf_loop_batch), which
+        # propagates sigma points through the level's @njit f/h
+        # (FilterModel.numba) and is therefore valid on every level (linear,
+        # pendulum, nonlinear, lorenz). Falls back to the pure-NumPy UKF below
+        # when the level ships no numba dynamics or numba isn't installed.
         self._use_numba = use_numba
   
     @property  
@@ -82,23 +85,21 @@ class UKFEstimator(BaseEstimator):
         x0_mean = self._model.x0_mean if self._model.x0_mean is not None else np.zeros(nx)
         x0_cov = self._model.x0_cov if self._model.x0_cov is not None else np.eye(nx)
 
-        if self._use_numba:
-            F = np.ascontiguousarray(self._model.F(np.zeros(nx)), dtype=np.float64)
-            H = np.ascontiguousarray(self._model.H(np.zeros(nx)), dtype=np.float64)
-            assert_linear_model(self._model.f, self._model.h, F, H, nx, ny)
-            Q64 = np.ascontiguousarray(Q, dtype=np.float64)
-            R64 = np.ascontiguousarray(R, dtype=np.float64)
-            x064 = np.ascontiguousarray(x0_mean, dtype=np.float64)
-            P064 = np.ascontiguousarray(x0_cov, dtype=np.float64)
-            estimates = np.zeros((N, T, nx))
-            for i in range(N):
-                obs64 = np.ascontiguousarray(observations[i], dtype=np.float64)
-                estimates[i] = ukf_linear_loop(
-                    F, H, Q64, R64, obs64, self._alpha, self._beta, self._kappa, x064, P064
-                )
-            return estimates
-
         timestamps = np.asarray(dataset.timestamps)
+
+        if self._use_numba and self._model.numba is not None:
+            nd = self._model.numba
+            return ukf_loop_batch(
+                nd.f, nd.h,
+                np.ascontiguousarray(Q, dtype=np.float64),
+                np.ascontiguousarray(R, dtype=np.float64),
+                np.ascontiguousarray(observations, dtype=np.float64),
+                np.ascontiguousarray(timestamps, dtype=np.float64),
+                self._alpha, self._beta, self._kappa,
+                np.ascontiguousarray(x0_mean, dtype=np.float64),
+                np.ascontiguousarray(x0_cov, dtype=np.float64),
+            )
+
         estimates = np.zeros((N, T, nx))
 
         for i in range(N):

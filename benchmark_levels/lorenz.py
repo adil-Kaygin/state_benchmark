@@ -6,7 +6,8 @@ from typing import Optional
   
 import numpy as np  
   
-from .base import BenchmarkLevel, BaseSimulator, FilterModel  
+from .base import BenchmarkLevel, BaseSimulator, FilterModel
+from ._numba_dynamics import build_lorenz_numba_dynamics
   
   
 class LorenzSimulator(BaseSimulator):  
@@ -171,8 +172,9 @@ class LorenzBenchmark(BenchmarkLevel):
                 [0.0, 1.0, 0.0],  
             ])  
   
-        return FilterModel(  
-            f=f, h=h, F=F_jac, H=H_jac,  
-            Q=self._Q.copy(), R=self._R.copy(),  
-            x0_mean=np.array([0.0, 0.0, 25.0]), x0_cov=np.eye(3),  
+        return FilterModel(
+            f=f, h=h, F=F_jac, H=H_jac,
+            Q=self._Q.copy(), R=self._R.copy(),
+            x0_mean=np.array([0.0, 0.0, 25.0]), x0_cov=np.eye(3),
+            numba=build_lorenz_numba_dynamics(sigma, rho, beta, dt),
         )

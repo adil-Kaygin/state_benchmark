@@ -6,7 +6,8 @@ from typing import Optional
   
 import numpy as np  
   
-from .base import BenchmarkLevel, BaseSimulator, FilterModel  
+from .base import BenchmarkLevel, BaseSimulator, FilterModel
+from ._numba_dynamics import build_nonlinear_numba_dynamics
   
   
 class NonlinearSimulator(BaseSimulator):  
@@ -129,4 +130,5 @@ class NonlinearBenchmark(BenchmarkLevel):
             f=f, h=h, F=F_jac, H=H_jac,
             Q=self._Q.copy(), R=self._R.copy(),
             x0_mean=np.zeros(1), x0_cov=np.eye(1),
+            numba=build_nonlinear_numba_dynamics(),
         )

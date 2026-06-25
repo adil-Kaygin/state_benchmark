@@ -111,6 +111,185 @@ def kf_loop_batch(
     return estimates
 
 
+@njit(cache=True, fastmath=True)
+def ekf_loop(
+    f,  # njit f(x, t) -> [nx]
+    h,  # njit h(x, t) -> [ny]
+    Fj,  # njit F_jac(x) -> [nx, nx]
+    Hj,  # njit H_jac(x) -> [ny, nx]
+    Q: np.ndarray,
+    R: np.ndarray,
+    observations: np.ndarray,  # [T, ny]
+    timestamps: np.ndarray,  # [T]
+    x0: np.ndarray,  # [nx]
+    P0: np.ndarray,  # [nx, nx]
+) -> np.ndarray:
+    """General (nonlinear) EKF over one trajectory, JIT-compiled.
+
+    f/h/Fj/Hj are themselves @njit functions supplied by the benchmark
+    (FilterModel.numba_dynamics); numba's first-class-function support lets
+    them be passed into and called from this compiled loop, so the EKF runs
+    fully in machine code instead of the pure-Python loop in ekf.py. The math
+    is identical to that fallback -- this is purely an inference accelerator.
+    """
+    T, ny = observations.shape
+    nx = Q.shape[0]
+    estimates = np.zeros((T, nx))
+
+    x = x0.copy()
+    P = P0.copy()
+    I = np.eye(nx)
+
+    for t in range(T):
+        x_pred = f(x, timestamps[t])
+        F = Fj(x)
+        P_pred = F @ P @ F.T + Q
+
+        H = Hj(x_pred)
+        y_pred = h(x_pred, timestamps[t])
+        S = H @ P_pred @ H.T + R
+        K = P_pred @ H.T @ np.linalg.inv(S)
+
+        x = x_pred + K @ (observations[t] - y_pred)
+        P = (I - K @ H) @ P_pred
+        estimates[t] = x
+
+    return estimates
+
+
+@njit(cache=True, fastmath=True)
+def ekf_loop_batch(
+    f, h, Fj, Hj,
+    Q: np.ndarray,
+    R: np.ndarray,
+    observations: np.ndarray,  # [N, T, ny]
+    timestamps: np.ndarray,  # [T]
+    x0: np.ndarray,
+    P0: np.ndarray,
+) -> np.ndarray:
+    N = observations.shape[0]
+    T = observations.shape[1]
+    nx = Q.shape[0]
+    estimates = np.zeros((N, T, nx))
+    for i in range(N):
+        estimates[i] = ekf_loop(f, h, Fj, Hj, Q, R, observations[i], timestamps, x0, P0)
+    return estimates
+
+
+@njit(cache=True, fastmath=True)
+def ukf_loop(
+    f,  # njit f(x, t) -> [nx]
+    h,  # njit h(x, t) -> [ny]
+    Q: np.ndarray,
+    R: np.ndarray,
+    observations: np.ndarray,  # [T, ny]
+    timestamps: np.ndarray,  # [T]
+    alpha: float,
+    beta: float,
+    kappa: float,
+    x0: np.ndarray,
+    P0: np.ndarray,
+) -> np.ndarray:
+    """General (nonlinear) UKF over one trajectory, JIT-compiled.
+
+    Unlike ukf_linear_loop (which bakes in f(x)=Fx, h(x)=Hx and so only fits
+    LinearBenchmark), this propagates each sigma point through the benchmark's
+    own @njit f/h, so it is correct for pendulum/nonlinear/lorenz too. Numbers
+    match the pure-NumPy UKF in ukf.py to fastmath tolerance.
+    """
+    T, ny = observations.shape
+    nx = Q.shape[0]
+    n_sig = 2 * nx + 1
+
+    lam = alpha * alpha * (nx + kappa) - nx
+    c = nx + lam
+    Wm = np.empty(n_sig)
+    Wc = np.empty(n_sig)
+    Wm[0] = lam / c
+    Wc[0] = lam / c + (1.0 - alpha * alpha + beta)
+    for i in range(1, n_sig):
+        Wm[i] = 1.0 / (2.0 * c)
+        Wc[i] = 1.0 / (2.0 * c)
+
+    estimates = np.zeros((T, nx))
+    x = x0.copy()
+    P = P0.copy()
+    jitter = 1e-9 * np.eye(nx)
+
+    for t in range(T):
+        # Cholesky can fail on a marginally non-PSD P; retry with jitter.
+        try:
+            sqrtP = np.linalg.cholesky(c * P)
+        except Exception:
+            sqrtP = np.linalg.cholesky(c * (P + jitter))
+
+        sigmas = np.empty((n_sig, nx))
+        sigmas[0] = x
+        for i in range(nx):
+            col = sqrtP[:, i]
+            sigmas[i + 1] = x + col
+            sigmas[nx + i + 1] = x - col
+
+        sig_f = np.empty((n_sig, nx))
+        for i in range(n_sig):
+            sig_f[i] = f(sigmas[i], timestamps[t])
+
+        x_pred = np.zeros(nx)
+        for i in range(n_sig):
+            x_pred += Wm[i] * sig_f[i]
+        P_pred = Q.copy()
+        for i in range(n_sig):
+            d = sig_f[i] - x_pred
+            P_pred += Wc[i] * np.outer(d, d)
+
+        sig_h = np.empty((n_sig, ny))
+        for i in range(n_sig):
+            sig_h[i] = h(sig_f[i], timestamps[t])
+
+        y_pred = np.zeros(ny)
+        for i in range(n_sig):
+            y_pred += Wm[i] * sig_h[i]
+
+        S = R.copy()
+        Pxy = np.zeros((nx, ny))
+        for i in range(n_sig):
+            dy = sig_h[i] - y_pred
+            dx = sig_f[i] - x_pred
+            S += Wc[i] * np.outer(dy, dy)
+            Pxy += Wc[i] * np.outer(dx, dy)
+
+        K = Pxy @ np.linalg.inv(S)
+        x = x_pred + K @ (observations[t] - y_pred)
+        P = P_pred - K @ S @ K.T
+        estimates[t] = x
+
+    return estimates
+
+
+@njit(cache=True, fastmath=True)
+def ukf_loop_batch(
+    f, h,
+    Q: np.ndarray,
+    R: np.ndarray,
+    observations: np.ndarray,  # [N, T, ny]
+    timestamps: np.ndarray,
+    alpha: float,
+    beta: float,
+    kappa: float,
+    x0: np.ndarray,
+    P0: np.ndarray,
+) -> np.ndarray:
+    N = observations.shape[0]
+    T = observations.shape[1]
+    nx = Q.shape[0]
+    estimates = np.zeros((N, T, nx))
+    for i in range(N):
+        estimates[i] = ukf_loop(
+            f, h, Q, R, observations[i], timestamps, alpha, beta, kappa, x0, P0
+        )
+    return estimates
+
+
 def ukf_sigma_points(
     x: np.ndarray, P: np.ndarray, nx: int, alpha: float, beta: float, kappa: float
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

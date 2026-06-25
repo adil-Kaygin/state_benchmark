@@ -9,6 +9,26 @@ import numpy as np
 
 
 @dataclass
+class NumbaDynamics:
+    """njit-compiled versions of a FilterModel's dynamics.
+
+    f/h/F_jac/H_jac here must be `@njit` functions with the SAME signatures and
+    math as the FilterModel's pure-Python f/h/F/H. They exist so the classical
+    filters (KF/EKF/UKF) can run their inner recursion fully inside numba
+    (see estimators/classical/_numba_kernels.py) instead of calling back into
+    Python every timestep. The Python callables remain the source of truth and
+    the numpy-fallback path; this is an optional accelerator only.
+
+    Convention (so one njit kernel fits every level):
+      f(x, t) -> [nx]   h(x, t) -> [ny]   F_jac(x) -> [nx, nx]   H_jac(x) -> [ny, nx]
+    """
+    f: Callable
+    h: Callable
+    F_jac: Callable
+    H_jac: Callable
+
+
+@dataclass
 class FilterModel:
     f: Callable
     h: Callable
@@ -18,6 +38,9 @@ class FilterModel:
     R: np.ndarray
     x0_mean: Optional[np.ndarray] = None
     x0_cov: Optional[np.ndarray] = None
+    # Optional @njit dynamics for the CPU-optimized filter kernels. None for
+    # levels that don't provide them (filters then use the numpy fallback).
+    numba: Optional[NumbaDynamics] = None
   
   
 class BaseSimulator(ABC):  

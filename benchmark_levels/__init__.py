@@ -1,4 +1,4 @@
-from .base import BenchmarkLevel, BaseSimulator, FilterModel  
+from .base import BenchmarkLevel, BaseSimulator, FilterModel, NumbaDynamics
 from .linear import LinearBenchmark  
 from .pendulum import PendulumBenchmark  
 from .lorenz import LorenzBenchmark  
@@ -14,8 +14,9 @@ BENCHMARK_LEVELS = {
 __all__ = [  
     "BenchmarkLevel",  
     "BaseSimulator",  
-    "FilterModel",  
-    "LinearBenchmark",  
+    "FilterModel",
+    "NumbaDynamics",
+    "LinearBenchmark",
     "PendulumBenchmark",  
     "LorenzBenchmark",  
     "NonlinearBenchmark",  

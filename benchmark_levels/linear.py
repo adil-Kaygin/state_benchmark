@@ -6,7 +6,8 @@ from typing import Optional
   
 import numpy as np  
   
-from .base import BenchmarkLevel, BaseSimulator, FilterModel  
+from .base import BenchmarkLevel, BaseSimulator, FilterModel, NumbaDynamics
+from ._numba_dynamics import build_linear_numba_dynamics
   
   
 class LinearSimulator(BaseSimulator):  
@@ -133,8 +134,9 @@ class LinearBenchmark(BenchmarkLevel):
         def H_jac(x: np.ndarray) -> np.ndarray:  
             return H_mat  
   
-        return FilterModel(  
-            f=f, h=h, F=F_jac, H=H_jac,  
-            Q=self._Q.copy(), R=self._R.copy(),  
-            x0_mean=np.zeros(2), x0_cov=np.eye(2) * self._initial_state_var,  
+        return FilterModel(
+            f=f, h=h, F=F_jac, H=H_jac,
+            Q=self._Q.copy(), R=self._R.copy(),
+            x0_mean=np.zeros(2), x0_cov=np.eye(2) * self._initial_state_var,
+            numba=build_linear_numba_dynamics(F_mat, H_mat),
         )
