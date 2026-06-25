@@ -140,20 +140,28 @@ class LorenzBenchmark(BenchmarkLevel):
         beta = self._beta  
         dt = self._dt  
   
-        def _derivative(state: np.ndarray) -> np.ndarray:  
-            xv, y, z = state  
-            return np.array([  
-                sigma * (y - xv),  
-                xv * (rho - z) - y,  
-                xv * y - beta * z,  
-            ])  
-  
-        def f(x: np.ndarray, t: float = 0.0) -> np.ndarray:  
-            k1 = _derivative(x)  
-            k2 = _derivative(x + 0.5 * dt * k1)  
-            k3 = _derivative(x + 0.5 * dt * k2)  
-            k4 = _derivative(x + dt * k3)  
-            return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)  
+        # The true Lorenz-63 attractor is bounded; a filter estimate that
+        # diverges can drive the RK4 step to overflow/NaN, which then poisons
+        # the rest of the run. Clip the state to a generous multiple of the
+        # attractor's extent so the dynamics stay finite without distorting
+        # behaviour near the attractor.
+        state_bound = 1.0e3
+
+        def _derivative(state: np.ndarray) -> np.ndarray:
+            xv, y, z = state
+            return np.array([
+                sigma * (y - xv),
+                xv * (rho - z) - y,
+                xv * y - beta * z,
+            ])
+
+        def f(x: np.ndarray, t: float = 0.0) -> np.ndarray:
+            x = np.clip(x, -state_bound, state_bound)
+            k1 = _derivative(x)
+            k2 = _derivative(x + 0.5 * dt * k1)
+            k3 = _derivative(x + 0.5 * dt * k2)
+            k4 = _derivative(x + dt * k3)
+            return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
   
         def h(x: np.ndarray, t: float = 0.0) -> np.ndarray:
             return np.array([x[0], x[1]])

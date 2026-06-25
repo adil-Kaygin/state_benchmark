@@ -29,6 +29,24 @@ except ImportError:
         return _decorator
 
 
+# Ceiling on covariance magnitude. A KF/EKF whose model is a poor fit for a
+# chaotic level (e.g. the linearized-at-origin KF, or the EKF when its estimate
+# wanders far from the true Lorenz trajectory) drives P up exponentially through
+# the F @ P @ F.T predict, eventually overflowing to inf/NaN and poisoning every
+# later step. Capping P keeps the run finite -- the filter still reports its
+# (legitimately bad) estimate instead of NaN -- which is the behaviour the
+# benchmark wants to measure.
+_COV_CEILING = 1.0e12
+
+
+@njit(cache=True, fastmath=True)
+def _bound_cov(P: np.ndarray) -> np.ndarray:
+    """Symmetrize P and clip its entries to +/-_COV_CEILING so a diverging
+    filter cannot overflow the predict step to inf/NaN."""
+    P = 0.5 * (P + P.T)
+    return np.minimum(np.maximum(P, -_COV_CEILING), _COV_CEILING)
+
+
 @njit(cache=True, fastmath=True)
 def _robust_chol(M: np.ndarray, nx: int, I: np.ndarray) -> np.ndarray:
     """Cholesky of a symmetric matrix that has drifted to (near-)singular.
@@ -101,13 +119,13 @@ def kf_loop(
 
     for t in range(T):
         x_pred = F @ x
-        P_pred = F @ P @ F.T + Q
+        P_pred = _bound_cov(F @ P @ F.T + Q)
 
         y = observations[t]
         S = H @ P_pred @ Ht + R
         K = P_pred @ Ht @ np.linalg.inv(S)
         x = x_pred + K @ (y - H @ x_pred)
-        P = (I - K @ H) @ P_pred
+        P = _bound_cov((I - K @ H) @ P_pred)
         estimates[t] = x
 
     return estimates
@@ -164,7 +182,7 @@ def ekf_loop(
     for t in range(T):
         x_pred = f(x, timestamps[t])
         F = Fj(x)
-        P_pred = F @ P @ F.T + Q
+        P_pred = _bound_cov(F @ P @ F.T + Q)
 
         H = Hj(x_pred)
         y_pred = h(x_pred, timestamps[t])
@@ -172,7 +190,7 @@ def ekf_loop(
         K = P_pred @ H.T @ np.linalg.inv(S)
 
         x = x_pred + K @ (observations[t] - y_pred)
-        P = (I - K @ H) @ P_pred
+        P = _bound_cov((I - K @ H) @ P_pred)
         estimates[t] = x
 
     return estimates

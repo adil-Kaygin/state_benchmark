@@ -138,8 +138,13 @@ def build_lorenz_numba_dynamics(sigma: float, rho: float, beta: float, dt: float
         out[2] = xv * y - beta * z
         return out
 
+    # Mirror lorenz.py: clip a diverging estimate so the chaotic RK4 step
+    # cannot overflow to inf/NaN. The true attractor is far inside this bound.
+    state_bound = 1.0e3
+
     @njit(cache=True, fastmath=True)
     def f(x, t):
+        x = np.minimum(np.maximum(x, -state_bound), state_bound)
         k1 = _deriv(x)
         k2 = _deriv(x + 0.5 * dt * k1)
         k3 = _deriv(x + 0.5 * dt * k2)

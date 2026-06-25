@@ -65,13 +65,23 @@ class EKFEstimator(BaseEstimator):
 
         estimates = np.zeros((N, T, nx))
 
+        # When the EKF estimate wanders far from the true (chaotic) trajectory,
+        # the Jacobian F = F(x) blows up and the F @ P @ F.T predict drives P to
+        # inf/NaN, poisoning the rest of the run. Cap P's magnitude so the run
+        # stays finite and reports its (legitimately poor) estimate instead.
+        cov_ceiling = 1.0e12
+
+        def _bound_cov(P: np.ndarray) -> np.ndarray:
+            P = 0.5 * (P + P.T)
+            return np.clip(P, -cov_ceiling, cov_ceiling)
+
         for i in range(N):
             x = x0_mean.copy()
             P = x0_cov.copy()
             for t in range(T):
                 x_pred = self._model.f(x, float(timestamps[t]))
                 F = self._model.F(x)
-                P_pred = F @ P @ F.T + Q
+                P_pred = _bound_cov(F @ P @ F.T + Q)
 
                 H = self._model.H(x_pred)
                 y_pred = self._model.h(x_pred)
@@ -79,7 +89,7 @@ class EKFEstimator(BaseEstimator):
                 K = P_pred @ H.T @ np.linalg.inv(S)
 
                 x = x_pred + K @ (observations[i, t] - y_pred)
-                P = (np.eye(nx) - K @ H) @ P_pred
+                P = _bound_cov((np.eye(nx) - K @ H) @ P_pred)
                 estimates[i, t] = x
 
         return estimates

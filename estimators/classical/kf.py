@@ -62,17 +62,28 @@ class KalmanFilterEstimator(BaseEstimator):
 
         estimates = np.zeros((N, T, nx))
 
+        # On a poorly-matched model (e.g. this linear KF on the chaotic Lorenz
+        # level, where F is just the dynamics linearized at the origin) the
+        # F @ P @ F.T predict grows P exponentially until it overflows to
+        # inf/NaN and poisons every later step. Cap P's magnitude so the run
+        # stays finite and still reports its (legitimately poor) estimate.
+        cov_ceiling = 1.0e12
+
+        def _bound_cov(P: np.ndarray) -> np.ndarray:
+            P = 0.5 * (P + P.T)
+            return np.clip(P, -cov_ceiling, cov_ceiling)
+
         for i in range(N):
             x = x0_mean.copy()
             P = x0_cov.copy()
             for t in range(T):
                 x_pred = F @ x
-                P_pred = F @ P @ F.T + Q
+                P_pred = _bound_cov(F @ P @ F.T + Q)
                 y = observations[i, t]
                 S = H @ P_pred @ H.T + R
                 K = P_pred @ H.T @ np.linalg.inv(S)
                 x = x_pred + K @ (y - H @ x_pred)
-                P = (np.eye(nx) - K @ H) @ P_pred
+                P = _bound_cov((np.eye(nx) - K @ H) @ P_pred)
                 estimates[i, t] = x
 
         return estimates
