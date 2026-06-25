@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -144,6 +145,8 @@ class KalmanNetEstimator(BaseEstimator):
         self._device_name = device
         self._random_seed = random_seed
         self._network = None
+        self._best_val_loss = float("inf")
+        self._best_state_dict = None
 
     @property
     def estimator_name(self) -> str:
@@ -229,6 +232,9 @@ class KalmanNetEstimator(BaseEstimator):
         )
 
         optimizer = torch.optim.Adam(network.parameters(), lr=self._lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6,
+        )
         mse = nn.MSELoss()
 
         def _loss(pred, log_var, target):
@@ -236,6 +242,9 @@ class KalmanNetEstimator(BaseEstimator):
                 var = torch.exp(log_var)
                 return nn.functional.gaussian_nll_loss(pred, target, var, eps=1e-6)
             return mse(pred, target)
+
+        self._best_val_loss = float("inf")
+        self._best_state_dict = None
 
         for epoch in range(self._num_epochs):
             network.train()
@@ -246,9 +255,14 @@ class KalmanNetEstimator(BaseEstimator):
                 pred, log_var = self._run_sequence(network, obs_b, device, training=True)
                 loss = _loss(pred, log_var, states_b)
 
+                # Skip update if loss is NaN or Inf to prevent weight corruption
+                if not math.isfinite(loss.item()):
+                    optimizer.zero_grad()
+                    continue
+
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(network.parameters(), 0.5)
                 optimizer.step()
 
             network.eval()
@@ -261,7 +275,21 @@ class KalmanNetEstimator(BaseEstimator):
                     val_loss_total += _loss(pred, log_var, states_b).item()
                     val_batches += 1
             val_loss = val_loss_total / max(val_batches, 1)
+
+            # Track best checkpoint in memory (only when loss is finite)
+            if math.isfinite(val_loss):
+                if val_loss < self._best_val_loss:
+                    self._best_val_loss = val_loss
+                    self._best_state_dict = {
+                        k: v.cpu().clone() for k, v in network.state_dict().items()
+                    }
+                scheduler.step(val_loss)
+
             print(f"[{self.estimator_name}] epoch {epoch + 1}/{self._num_epochs} val_loss={val_loss:.6f}")
+
+        # Load best checkpoint if available; otherwise keep the last state
+        if self._best_state_dict is not None:
+            network.load_state_dict(self._best_state_dict)
 
         self._network = network.to("cpu")
 
