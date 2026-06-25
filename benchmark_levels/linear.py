@@ -124,7 +124,7 @@ class LinearBenchmark(BenchmarkLevel):
         def f(x: np.ndarray, t: float = 0.0) -> np.ndarray:
             return F_mat @ x
   
-        def h(x: np.ndarray) -> np.ndarray:  
+        def h(x: np.ndarray, t: float = 0.0) -> np.ndarray:
             return H_mat @ x  
   
         def F_jac(x: np.ndarray) -> np.ndarray:  
