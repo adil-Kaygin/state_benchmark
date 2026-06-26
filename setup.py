@@ -10,6 +10,7 @@ setup(
         "h5py>=3.8",
         "torch>=2.0",
         "matplotlib>=3.7",
+        "comet_ml>=3.0",
     ],
     extras_require={
         "dev": [

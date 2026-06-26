@@ -31,3 +31,32 @@ def get_logger(
             logger.addHandler(fh)  
   
     return logger
+
+
+class CometExperimentLogger:
+    """Thin wrapper: one Comet experiment per (benchmark_level, model) run."""
+
+    def __init__(
+        self,
+        api_key: str,
+        project_name: str,
+        workspace: Optional[str] = None,
+    ) -> None:
+        self._api_key = api_key
+        self._project_name = project_name
+        self._workspace = workspace
+
+    def start(self, benchmark_level: str, model_name: str):
+        from comet_ml import Experiment
+
+        experiment = Experiment(
+            api_key=self._api_key,
+            project_name=self._project_name,
+            workspace=self._workspace,
+        )
+        experiment.set_name(f"{benchmark_level}_{model_name}")
+        experiment.log_parameter("benchmark_level", benchmark_level)
+        experiment.log_parameter("model_name", model_name)
+        experiment.add_tag(benchmark_level)
+        experiment.add_tag(model_name)
+        return experiment
