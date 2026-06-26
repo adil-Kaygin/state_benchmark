@@ -134,6 +134,7 @@ class KalmanNetEstimator(BaseEstimator):
         batch_size: int = 32,
         device: Optional[str] = None,
         random_seed: int = 0,
+        grad_clip_norm: float = 0.5,
     ) -> None:
         self._model = filter_model
         self._nx = filter_model.Q.shape[0]
@@ -144,6 +145,7 @@ class KalmanNetEstimator(BaseEstimator):
         self._batch_size = batch_size
         self._device_name = device
         self._random_seed = random_seed
+        self._grad_clip_norm = grad_clip_norm
         self._network = None
         self._best_val_loss = float("inf")
         self._best_state_dict = None
@@ -262,7 +264,7 @@ class KalmanNetEstimator(BaseEstimator):
 
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(network.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(network.parameters(), self._grad_clip_norm)
                 optimizer.step()
 
             network.eval()

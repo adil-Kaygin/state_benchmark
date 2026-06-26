@@ -29,10 +29,51 @@ def plot_trajectory(
     ax.grid(True)  
     fig.tight_layout()  
   
-    if output_path is not None:  
-        output_path.parent.mkdir(parents=True, exist_ok=True)  
-        fig.savefig(output_path, dpi=150)  
-    else:  
-        plt.show()  
-  
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150)
+    else:
+        plt.show()
+
+    plt.close(fig)
+
+
+def plot_states_all_dims(
+    states: np.ndarray,
+    estimates: np.ndarray,
+    timestamps: np.ndarray,
+    trajectory_index: int = 0,
+    title: str = "State Trajectory (all dimensions)",
+    output_path: Optional[Path] = None,
+) -> None:
+    """
+    State-wise ground-truth vs. prediction: one subplot per state dimension
+    for a single trajectory, complementing plot_trajectory (single dim).
+    """
+    import matplotlib.pyplot as plt
+
+    nx = states.shape[2]
+    fig, axes = plt.subplots(nx, 1, figsize=(10, 3 * nx), sharex=True, squeeze=False)
+
+    for i in range(nx):
+        ax = axes[i, 0]
+        ax.plot(timestamps, states[trajectory_index, :, i],
+                label="True State", linewidth=1.5)
+        ax.plot(timestamps, estimates[trajectory_index, :, i],
+                label="Estimate", linestyle="--", linewidth=1.5)
+        ax.set_ylabel(f"State[{i}]")
+        ax.grid(True)
+        if i == 0:
+            ax.legend()
+
+    axes[-1, 0].set_xlabel("Time")
+    fig.suptitle(title)
+    fig.tight_layout()
+
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150)
+    else:
+        plt.show()
+
     plt.close(fig)

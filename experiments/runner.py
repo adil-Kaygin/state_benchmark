@@ -1,11 +1,11 @@
 from __future__ import annotations  
   
-import time  
-import uuid  
-from pathlib import Path  
-from typing import Optional  
-  
-import numpy as np  
+import time
+import uuid
+from pathlib import Path
+from typing import Optional, TYPE_CHECKING
+
+import numpy as np
   
 from .config import ExperimentConfig
 from .result import ExperimentResult
@@ -15,6 +15,9 @@ from metrics.rmse import compute_rmse
 from metrics.memory import measure_memory
 from metrics.runtime import runtime_per_step_ms as _runtime_per_step_ms
 from storage.repository import ExperimentRepository
+
+if TYPE_CHECKING:
+    from utils.logging import CometExperimentLogger
   
   
 def _to_numpy(arr) -> np.ndarray:  
@@ -23,15 +26,21 @@ def _to_numpy(arr) -> np.ndarray:
     return np.asarray(arr)  
   
   
-class ExperimentRunner:  
-  
-    def __init__(  
-        self,  
-        repository: ExperimentRepository,  
-        artifacts_dir: Path,  
-    ) -> None:  
-        self._repository = repository  
-        self._artifacts_dir = artifacts_dir  
+class ExperimentRunner:
+
+    def __init__(
+        self,
+        repository: ExperimentRepository,
+        artifacts_dir: Path,
+        comet_logger: Optional["CometExperimentLogger"] = None,
+    ) -> None:
+        self._repository = repository
+        self._artifacts_dir = artifacts_dir
+        # Optional, off by default. When set, finished ExperimentResults are
+        # queued for a single batched Comet push (see
+        # CometExperimentLogger.flush) -- the runner does not recompute or
+        # log anything to Comet beyond forwarding the already-computed result.
+        self._comet_logger = comet_logger
   
     def run(  
         self,  
@@ -94,10 +103,23 @@ class ExperimentRunner:
                     figure_path=None,  
                 )  
   
-            self._repository.update_experiment_status(experiment_id, "completed")  
-  
-        except Exception:  
-            self._repository.update_experiment_status(experiment_id, "failed")  
-            raise  
-  
+            self._repository.update_experiment_status(experiment_id, "completed")
+
+            if self._comet_logger is not None:
+                self._comet_logger.log_result(result)
+
+        except Exception:
+            self._repository.update_experiment_status(experiment_id, "failed")
+            raise
+
         return result
+
+    def flush_comet_logger(self):
+        """
+        Push all ExperimentResults queued so far in a single batched Comet
+        experiment. Call once after a sweep of run() calls; no-op if no
+        comet_logger was passed to __init__.
+        """
+        if self._comet_logger is not None:
+            return self._comet_logger.flush()
+        return None
