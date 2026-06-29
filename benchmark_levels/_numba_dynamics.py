@@ -12,8 +12,12 @@ resulting functions match the generic kernel signature used by KF/EKF/UKF
 These are kept in their own module (file-backed, so `@njit(cache=True)` can
 persist compiled artifacts) and deliberately mirror the pure-Python f/h/F/H in
 linear.py / pendulum.py / nonlinear.py / lorenz.py one-for-one. If you change
-the math in a level's `get_filter_model`, change it here too -- the regression
-tests (tests/test_classical_filters.py) assert the two paths agree.
+the math in a level's `get_filter_model`, change it here too.
+
+numba is a HARD dependency: the classical filters run exclusively on these
+@njit dynamics (there is no pure-NumPy filter path). Per the "fail fast and
+loud" rule, a missing numba raises ImportError here rather than silently
+producing un-jitted closures.
 """
 
 import numpy as np
@@ -22,16 +26,11 @@ from .base import NumbaDynamics
 
 try:
     from numba import njit
-    NUMBA_AVAILABLE = True
-except ImportError:  # pragma: no cover - numba is an optional accelerator
-    NUMBA_AVAILABLE = False
-
-    def njit(*args, **kwargs):
-        def _decorator(func):
-            return func
-        if args and callable(args[0]) and not kwargs:
-            return args[0]
-        return _decorator
+except ImportError as exc:  # fail fast and loud -- no NumPy fallback
+    raise ImportError(
+        "numba is required to build the level dynamics consumed by the "
+        "classical filters. Install numba (`pip install numba`)."
+    ) from exc
 
 
 def build_linear_numba_dynamics(F_mat: np.ndarray, H_mat: np.ndarray) -> NumbaDynamics:
