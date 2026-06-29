@@ -135,6 +135,14 @@ class KalmanNetEstimator(BaseEstimator):
         device: Optional[str] = None,
         random_seed: int = 0,
         grad_clip_norm: float = 0.5,
+        weight_decay: float = 0.0,
+        scheduler: str = "plateau",
+        scheduler_factor: float = 0.5,
+        scheduler_patience: int = 2,
+        min_lr: float = 1e-6,
+        early_stopping_patience: Optional[int] = None,
+        early_stopping_min_delta: float = 0.0,
+        verbose: bool = True,
     ) -> None:
         self._model = filter_model
         self._nx = filter_model.Q.shape[0]
@@ -146,9 +154,21 @@ class KalmanNetEstimator(BaseEstimator):
         self._device_name = device
         self._random_seed = random_seed
         self._grad_clip_norm = grad_clip_norm
+        self._weight_decay = weight_decay
+        self._scheduler = scheduler
+        self._scheduler_factor = scheduler_factor
+        self._scheduler_patience = scheduler_patience
+        self._min_lr = min_lr
+        self._early_stopping_patience = early_stopping_patience
+        self._early_stopping_min_delta = early_stopping_min_delta
+        self._verbose = verbose
         self._network = None
         self._best_val_loss = float("inf")
         self._best_state_dict = None
+        # Populated by fit(): per-epoch training diagnostics.
+        self.history_ = {"train_loss": [], "val_loss": [], "lr": [], "epoch": []}
+        self.best_epoch_ = None
+        self.stopped_epoch_ = None
 
     @property
     def estimator_name(self) -> str:
@@ -157,6 +177,36 @@ class KalmanNetEstimator(BaseEstimator):
     @property
     def estimator_type(self) -> str:
         return "neural"
+
+    @property
+    def best_val_loss(self) -> float:
+        return self._best_val_loss
+
+    def _build_scheduler(self, optimizer):
+        import torch
+
+        name = (self._scheduler or "none").lower()
+        if name in ("none", "off"):
+            return None
+        if name == "plateau":
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=self._scheduler_factor,
+                patience=self._scheduler_patience,
+                min_lr=self._min_lr,
+            )
+        if name == "cosine":
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(self._num_epochs, 1), eta_min=self._min_lr
+            )
+        if name == "step":
+            return torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=max(self._scheduler_patience, 1),
+                gamma=self._scheduler_factor,
+            )
+        raise ValueError(f"Unknown scheduler '{self._scheduler}'")
 
     def _training_device(self):
         import torch
@@ -233,10 +283,10 @@ class KalmanNetEstimator(BaseEstimator):
             shuffle=False,
         )
 
-        optimizer = torch.optim.Adam(network.parameters(), lr=self._lr)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6,
+        optimizer = torch.optim.Adam(
+            network.parameters(), lr=self._lr, weight_decay=self._weight_decay
         )
+        scheduler = self._build_scheduler(optimizer)
         mse = nn.MSELoss()
 
         def _loss(pred, log_var, target):
@@ -247,9 +297,16 @@ class KalmanNetEstimator(BaseEstimator):
 
         self._best_val_loss = float("inf")
         self._best_state_dict = None
+        self.history_ = {"train_loss": [], "val_loss": [], "lr": [], "epoch": []}
+        self.best_epoch_ = None
+        self.stopped_epoch_ = None
+        epochs_no_improve = 0
 
         for epoch in range(self._num_epochs):
+            current_lr = optimizer.param_groups[0]["lr"]
+
             network.train()
+            train_loss_total, train_batches = 0.0, 0
             for obs_b, states_b in train_loader:
                 obs_b = obs_b.to(device)
                 states_b = states_b.to(device)
@@ -267,6 +324,10 @@ class KalmanNetEstimator(BaseEstimator):
                 torch.nn.utils.clip_grad_norm_(network.parameters(), self._grad_clip_norm)
                 optimizer.step()
 
+                train_loss_total += loss.item()
+                train_batches += 1
+            train_loss = train_loss_total / max(train_batches, 1)
+
             network.eval()
             val_loss_total, val_batches = 0.0, 0
             with torch.no_grad():
@@ -278,16 +339,46 @@ class KalmanNetEstimator(BaseEstimator):
                     val_batches += 1
             val_loss = val_loss_total / max(val_batches, 1)
 
+            self.history_["epoch"].append(epoch + 1)
+            self.history_["train_loss"].append(train_loss)
+            self.history_["val_loss"].append(val_loss)
+            self.history_["lr"].append(current_lr)
+
+            improved = False
             # Track best checkpoint in memory (only when loss is finite)
             if math.isfinite(val_loss):
-                if val_loss < self._best_val_loss:
+                if val_loss < self._best_val_loss - self._early_stopping_min_delta:
                     self._best_val_loss = val_loss
                     self._best_state_dict = {
                         k: v.cpu().clone() for k, v in network.state_dict().items()
                     }
-                scheduler.step(val_loss)
+                    self.best_epoch_ = epoch + 1
+                    improved = True
+                if scheduler is not None:
+                    if self._scheduler == "plateau":
+                        scheduler.step(val_loss)
+                    else:
+                        scheduler.step()
 
-            print(f"[{self.estimator_name}] epoch {epoch + 1}/{self._num_epochs} val_loss={val_loss:.6f}")
+            epochs_no_improve = 0 if improved else epochs_no_improve + 1
+
+            if self._verbose:
+                print(
+                    f"[{self.estimator_name}] epoch {epoch + 1}/{self._num_epochs} "
+                    f"train_loss={train_loss:.6f} val_loss={val_loss:.6f} lr={current_lr:.2e}"
+                )
+
+            if (
+                self._early_stopping_patience is not None
+                and epochs_no_improve >= self._early_stopping_patience
+            ):
+                self.stopped_epoch_ = epoch + 1
+                if self._verbose:
+                    print(
+                        f"[{self.estimator_name}] early stopping at epoch {epoch + 1} "
+                        f"(best val_loss={self._best_val_loss:.6f} @ epoch {self.best_epoch_})"
+                    )
+                break
 
         # Load best checkpoint if available; otherwise keep the last state
         if self._best_state_dict is not None:
