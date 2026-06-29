@@ -9,6 +9,8 @@ from the READMEs (which document what the code does). Each item is tagged:
 - **[debatable-choice]** — a defensible decision with a real downside worth
   naming.
 - **[valid-as-is]** — confirmed sound; recorded so it isn't re-litigated.
+- **[resolved]** — was one of the above; fixed in code, kept here as a record of
+  what changed and why.
 
 Per-module critiques live in `benchmark_levels/Critique.md`,
 `estimators/Critique.md`, `metrics/Critique.md`, `visualization/Critique.md`.
@@ -35,23 +37,18 @@ different seeds.
 maybe median) before ranking; surface the spread in `plot_rmse_comparison` as
 error bars.
 
-## 2. No filter-consistency check (NEES/NIS) — [design-limitation]
+## 2. No filter-consistency check (NEES/NIS) — [resolved]
 
-The benchmark scores estimators on point-RMSE only. It never checks whether each
-filter's reported covariance `P` is **consistent** with its actual error —
-i.e. the Normalized Estimation Error Squared (NEES) against the χ² bounds, the
-Normalized Innovation Squared (NIS), or innovation whiteness. These are the
-textbook tools (Bar-Shalom et al.) for deciding whether a filter is
-*over-confident* or *under-confident*, not just accurate.
-
-Consequence: a filter can post a competitive RMSE while being badly inconsistent
-(its `P` does not reflect its true uncertainty), and this benchmark would not
-distinguish it from a well-calibrated filter. For Kalman-family filters whose
-entire premise is a calibrated posterior, omitting consistency is a real gap.
-
-*Recommendation:* have estimators optionally expose their per-step `P` (and `S`),
-add a `metrics/consistency.py` computing average NEES/NIS, and flag values
-outside the χ² interval.
+*Was a design-limitation; fixed.* `metrics/uncertainty.py` adds `compute_nees`
+(mean Normalized Estimation Error Squared against the truth, with
+`compute_nees_chi2_bounds` for the χ² acceptance interval) and `compute_nll`
+(Gaussian negative log-likelihood) — both score whether a filter's reported `P`
+is consistent with its actual error, not just how accurate its point estimate
+is. Verified analytically: a consistent synthetic filter gives mean NEES ≈ `nx`
+and NLL matching the closed-form Gaussian value. NIS (innovation-based, scored
+before the update rather than against truth) and a `metrics/`-level wiring of
+estimators exposing per-step `P` to the runner remain open if a no-ground-truth
+consistency check is wanted in addition.
 
 ## 3. No optimality reference beyond the linear level — [design-limitation]
 
@@ -65,49 +62,46 @@ say how far the best of them is from the achievable optimum.
 *Recommendation:* compute the PCRLB for at least one nonlinear level, or run a
 very-large-`M` particle filter as an approximate-optimal baseline.
 
-## 4. Latency excludes fit() and JIT warm-up — [debatable-choice]
+## 4. Latency excludes fit() and JIT warm-up — [debatable-choice, partly resolved]
 
-`runner.run` times only `estimator.estimate()` with `time.perf_counter()`
-([runner.py:66-68](experiments/runner.py#L66)); `fit()` and numba's first-call
-JIT compilation are outside the timed window. Read as **in-flight inference
-latency**, this is defensible (training/compilation are amortized, one-time,
-"pre-flight" costs). Two caveats keep it from being a clean cross-estimator
-number:
+`runner.run` times only `estimator.estimate()` with `time.perf_counter()`; `fit()`
+and numba's first-call JIT compilation are outside the timed window. Read as
+**in-flight inference latency**, this is defensible (training/compilation are
+amortized, one-time, "pre-flight" costs). Remaining caveats:
 
 1. **It is not disclosed in the stored metric.** `ExperimentResult` records
    `runtime_seconds`/`runtime_per_step_ms` with no field marking that `fit()` and
    warm-up were excluded — a reader of the SQLite log has no way to know.
-2. **KalmanNet's timed `estimate()` is dominated by an implementation artifact,
-   not its algorithm.** `_process_model_step`
-   ([estimators/neural/kalmannet.py:100-109](estimators/neural/kalmannet.py#L100))
-   round-trips every state vector through NumPy (`tensor → cpu().numpy() → Python
-   loop calling f → tensor`) once per timestep. That per-row Python loop, not the
-   GRU, dominates the wall-clock time. So KalmanNet's latency reflects how its
-   predict step is *wired*, not the cost of the learned-gain idea — making a
-   latency comparison against the vectorized classical filters not
-   apples-to-apples.
+2. **[resolved] KalmanNet's `estimate()` cost is now intentional, not an
+   implementation accident.** The old per-row NumPy round-trip
+   (`_process_model_step`) has been removed from *training*, which now runs
+   fully vectorized on the GPU (see `estimators/Critique.md §4`). Test-time
+   `estimate()` is now **deliberately** strictly sequential on the CPU
+   (`_run_sequence_sequential_cpu`), simulating microprocessor deployment — so
+   its latency reflects that chosen deployment condition, not a wiring mistake.
+   It is still not apples-to-apples against the vectorized classical filters,
+   but that asymmetry is now a stated experimental design choice rather than an
+   unexamined artifact; it should still be labelled as such in any latency
+   comparison table.
 3. Numba estimators get their first-call JIT cost excluded only if a warm-up call
    happened earlier in the same process; `run()` does not do a throwaway warm-up,
    so the **first** benchmarked numba estimator in a fresh process can absorb
    compilation time inside its timed window, while a later one does not.
 
-*Recommendation:* record a boolean/columns documenting what the timer includes;
-do one warm-up `estimate()` before the timed call; and either vectorize
-KalmanNet's predict or annotate its latency as implementation-bound.
+*Recommendation:* record a boolean/column documenting what the timer includes,
+and do one warm-up `estimate()` before the timed call.
 
-## 5. Memory metric is whole-process RSS — [design-limitation]
+## 5. Memory metric is whole-process RSS — [resolved]
 
-`measure_memory()` returns `psutil.Process(os.getpid()).memory_info().rss`
-([metrics/memory.py:14](metrics/memory.py#L14)) — the **entire process's**
-resident memory at the moment it is called, not the estimator's own allocation.
-By the time it runs, the process has loaded numpy, torch, numba caches, the full
-dataset, and every prior estimator's leftovers. So `memory_mb` is essentially a
-constant process baseline plus noise, not a per-estimator footprint, and should
-not be used to compare estimators' memory cost.
-
-*Recommendation:* measure a *delta* (RSS after − RSS before the estimator runs,
-or `tracemalloc` peak around `estimate()`), and run each estimator in a fresh
-subprocess if a clean number is needed.
+*Was a design-limitation; the metric is now disabled rather than fixed in place.*
+`measure_memory()` previously returned `psutil.Process(os.getpid()).memory_info().rss`
+— the **entire process's** resident memory, not the estimator's own allocation,
+so it was a constant process baseline plus noise rather than a useful
+per-estimator footprint. It now raises `NotImplementedError("Memory measurement
+is currently unsupported.")` instead of reporting that misleading number; the
+runner no longer calls it or stores a `memory_mb` column. A correct per-estimator
+metric (RSS delta, `tracemalloc` peak, or a fresh-subprocess measurement) remains
+open if memory tracking is wanted again.
 
 ## 6. Time-threading is correct, but asymmetric — [valid-as-is]
 
@@ -128,9 +122,9 @@ Recorded here because the asymmetry looks like an omission but is intended.
 
 | # | Issue | Tag | Where |
 |---|-------|-----|-------|
-| 1 | Single run, no seed-averaging / error bars | design-limitation | runner.py:63-95 |
-| 2 | No NEES/NIS filter-consistency check | design-limitation | metrics/ (absent) |
+| 1 | Single run, no seed-averaging / error bars | design-limitation | runner.py |
+| 2 | No NEES/NIS filter-consistency check | resolved (NEES + NLL added) | metrics/uncertainty.py |
 | 3 | No PCRLB / optimal baseline on nonlinear levels | design-limitation | benchmark_levels/ (absent) |
-| 4 | Latency excludes fit/JIT; KalmanNet impl-bound; not disclosed | debatable-choice | runner.py:66-68, kalmannet.py:100 |
-| 5 | Memory = whole-process RSS, not per-estimator | design-limitation | metrics/memory.py:14 |
-| 6 | KF correctly does not thread time t | valid-as-is | kf.py:44-45 |
+| 4 | Latency excludes fit/JIT; KalmanNet impl-bound; not disclosed | partly resolved (KalmanNet CPU-sequential by design) | runner.py, kalmannet.py |
+| 5 | Memory = whole-process RSS, not per-estimator | resolved (disabled, raises NotImplementedError) | metrics/memory.py |
+| 6 | KF correctly does not thread time t | valid-as-is | kf.py |

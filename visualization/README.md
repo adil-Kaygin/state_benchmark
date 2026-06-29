@@ -7,11 +7,12 @@ and either shows or saves a matplotlib figure. None of these functions touch
 `benchmark_levels/README.md` and `estimators/README.md`.
 
 ```
-trajectory.py  : plot_trajectory          single state dim, x_t (truth) vs x̂_t (estimate)
-                 plot_states_all_dims      same, but one subplot per state dimension
-rmse.py        : plot_rmse_comparison      bar chart, one compute_rmse() scalar per estimator
-                 plot_rmse_per_timestep    line plot, compute_rmse_per_timestep() per estimator
-runtime.py     : plot_runtime_comparison   bar chart, one runtime_per_step_ms scalar per estimator
+trajectory.py  : plot_trajectory             single state dim, x_t (truth) vs x̂_t (estimate)
+                 plot_states_all_dims        same, but one subplot per state dimension
+rmse.py        : plot_rmse_comparison_per_dim   grouped bar chart, compute_rmse_per_dim() per
+                                                 estimator x named state variable -- no pooled scalar
+                 plot_rmse_per_timestep      line plot, compute_rmse_per_timestep() per estimator
+runtime.py     : plot_runtime_comparison     bar chart, one runtime_per_step_ms scalar per estimator
 ```
 
 All five are exported from `visualization/__init__.py`'s `__all__`.
@@ -36,21 +37,25 @@ trajectories in that split — see `datasets/schema.py`).
 
 ## rmse.py / runtime.py — bar charts and per-timestep lines
 
-`plot_rmse_comparison` and `plot_runtime_comparison` are thin bar-chart wrappers
-over `(estimator_names, values)` pairs — no new math. `rmse_values` /
-`runtime_values` are expected to already be the output of
-`metrics.rmse.compute_rmse` / `metrics.latency.latency_ms_per_step`. Mismatched
-units (e.g. passing raw seconds into the "ms/step" plot) are not caught here —
-the caller must use the right metric function first. Call the RMSE comparison
-once per benchmark (one figure per benchmark), not on a cross-benchmark average
-of raw `compute_rmse` values (see `metrics/Critique.md` for why that average is
-not physically meaningful).
+`plot_rmse_comparison_per_dim` takes `{estimator_name: {state_var: rmse}}` (the
+output of `metrics.rmse.compute_rmse_per_dim`, one call per estimator) plus the
+ordered `state_names`, and draws a **grouped** bar chart: one group per named
+state variable, one bar per estimator within each group. There is no pooled
+scalar to plot — mixing dimensions of different physical units into a single
+bar was removed at the metric layer (`metrics/Critique.md §1`), so the plot
+layer cannot resurrect it. Raises `ValueError` if any estimator is missing an
+RMSE for a declared state variable.
+
+`plot_runtime_comparison` is a thin bar-chart wrapper over
+`(estimator_names, values)` — no new math; `runtime_values` are expected to
+already be the output of `metrics.latency.latency_ms_per_step`. Mismatched units
+(e.g. passing raw seconds into the "ms/step" plot) are not caught here — the
+caller must use the right metric function first.
 
 `plot_rmse_per_timestep` takes a `{estimator_name: compute_rmse_per_timestep(...)}`
 dict and overlays one line per estimator against `timestamps` — use it to see
 *when* in a trajectory a filter's error grows (e.g. EKF/UKF divergence on
-`lorenz`'s chaotic dynamics), which the single scalar from `plot_rmse_comparison`
-can't show.
+`lorenz`'s chaotic dynamics), which the per-variable bar chart can't show.
 
 ## Extending with a new plot
 

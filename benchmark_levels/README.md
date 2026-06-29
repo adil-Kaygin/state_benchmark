@@ -24,9 +24,20 @@ filters:
   linear).
 - `x0_mean` / `x0_cov` expose the generative prior so estimators initialise from
   the true prior instead of a hardcoded default.
-- `numba` is an optional `NumbaDynamics` mirror of `f/h/F_jac/H_jac` as `@njit`
-  closures (built in `_numba_dynamics.py`), used only as a speed accelerator —
-  the Python callables remain the source of truth.
+- `numba` is a `NumbaDynamics` mirror of `f/h/F_jac/H_jac` as `@njit` closures
+  (built in `_numba_dynamics.py`). It is **required** by the classical filters —
+  they run exclusively on it (there is no pure-NumPy fallback); EKF/UKF raise if
+  it is `None`. The Python callables remain the source of truth and must match
+  the numba math one-for-one.
+- `torch` is an optional `TorchDynamics` mirror of `f/h` as **batched** torch
+  closures (`[B,nx]→[B,nx]/[B,ny]`, built in `_torch_dynamics.py`), used only by
+  KalmanNet for vectorized GPU training. torch is imported lazily inside the
+  closures, so levels still import without torch installed.
+
+Each `BenchmarkLevel` also exposes `state_names` — the physical name of every
+state dimension (`("x","y","z")` for Lorenz, `("theta","omega")` for pendulum,
+`("position","velocity")` for linear, `("x",)` for nonlinear). Metrics and plots
+use these to label per-dimension RMSE with the real variable instead of an index.
 
 `f` has signature `f(x, t=0.0)`; the `t` argument lets a level carry
 time-varying forcing (see `nonlinear.py`).
@@ -122,10 +133,21 @@ x_0 ~ N([0, 0, 25], I)
   dynamics, not a bug).
 - The simulator step and `get_filter_model().f` use the **identical** 4-stage
   RK4 integrator, so the filter's process model matches the data generator.
-- Analytic Jacobian: `F_jac(x) = I + dt·J(x)` where `J` is the Lorenz vector
-  field's Jacobian (a first-order, Euler-equivalent linearization of the RK4
-  step). `H_jac` selects `[x, y]`.
+- Analytic Jacobian (standard `LorenzBenchmark`): the **exact Jacobian of the
+  RK4 step**, computed by the chain rule through the four stages, so the EKF/KF
+  covariance is propagated with the same `O(dt⁴)` accuracy as the mean `f`.
+  `H_jac` selects `[x, y]`.
 - `x0_mean = [0, 0, 25]`, `x0_cov = I` (matches the data generator's init).
+
+### `lorenz_fea` — `LorenzFEABenchmark` (Forward-Euler-Approximation baseline)
+
+Identical data generation and `f`/`h` to `LorenzBenchmark`, but the EKF/KF
+Jacobian is the **first-order** `F_jac(x) = I + dt·J(x)` (the forward-Euler
+linearization of the flow, *not* the Jacobian of the RK4 map). Because `f` is
+RK4 (`O(dt⁴)`) while this `F` is `O(dt)`, mean and covariance are propagated at
+inconsistent orders. Registered as `lorenz_fea` and retained **only as a
+baseline** to quantify the cost of that inconsistency against the standard
+`lorenz`. Prefer `lorenz` for any real comparison.
 - **State clip (filter only):** `f` clips its input to `±1e3` before integrating
   (mirrored in the numba dynamics). The true attractor lives within roughly
   `[-20,20]×[-25,25]×[0,50]`; `1e3` is ~20–50× that extent, so the bound never
@@ -136,7 +158,8 @@ x_0 ~ N([0, 0, 25], I)
 
 ## Extending with a new level
 
-1. Subclass `BenchmarkLevel` (`__init__.py` registers it in `BENCHMARK_LEVELS`).
+1. Subclass `BenchmarkLevel` (`__init__.py` registers it in `BENCHMARK_LEVELS`)
+   and implement `state_names` (one physical name per state dimension).
 2. Implement a `BaseSimulator` with `step(state, control, dt) -> state` (adds
    process noise) and `observe(state) -> obs` (adds observation noise).
 3. `get_filter_model()` must return `f`/`h` as *noise-free* deterministic maps
@@ -145,5 +168,8 @@ x_0 ~ N([0, 0, 25], I)
 4. If `f`/`h` are nonlinear, supply exact Jacobians `F`/`H` — EKF accuracy is only
    as good as these derivatives.
 5. Expose the generative prior via `x0_mean` / `x0_cov` in `get_filter_model()`.
-6. Optionally supply a `NumbaDynamics` (see `_numba_dynamics.py`) for the njit
-   fast paths; keep it bit-equivalent to the Python `f/h/F_jac/H_jac`.
+6. Supply a `NumbaDynamics` (see `_numba_dynamics.py`) — it is **required** for
+   the classical filters (no NumPy fallback); keep it bit-equivalent to the
+   Python `f/h/F_jac/H_jac`.
+7. To train KalmanNet on the level, also supply a `TorchDynamics` (batched torch
+   `f`/`h`, see `_torch_dynamics.py`), mirroring the same math.

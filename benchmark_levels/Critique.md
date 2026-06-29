@@ -6,30 +6,16 @@ root [Critique.md](../Critique.md) for cross-cutting issues.
 
 ---
 
-## 1. Lorenz EKF Jacobian is one integration-order below `f` — [design-limitation]
+## 1. Lorenz EKF Jacobian one integration-order below `f` — [resolved]
 
-The filter's process model `f` is a full 4-stage **RK4** step
-([lorenz.py:158-164](lorenz.py#L158)), matching the simulator. But the Jacobian
-handed to EKF/KF is `F_jac(x) = I + dt·J(x)`
-([lorenz.py:169-175](lorenz.py#L169)) — the **first-order (forward-Euler)**
-linearization of the flow, *not* the Jacobian of the RK4 map.
-
-So within a single EKF step the **mean** is propagated with `O(dt⁴)` accuracy
-(RK4) while the **covariance** is propagated with the `O(dt)` Euler Jacobian.
-The two are internally inconsistent: the linearization EKF uses to push `P`
-forward does not match the nonlinear map it uses to push `x` forward. On a
-chaotic system, where the local Jacobian is exactly what governs error growth,
-this is the wrong sensitivity matrix. `summary.md` half-acknowledges this
-("linearized RK4-Euler-equivalent, first-order in `dt`").
-
-For small `dt` the discrepancy is `O(dt²)` and may be tolerable, but it is a
-genuine fidelity gap, and it biases EKF specifically (UKF/PF don't use `F_jac`,
-so they are unaffected — which can make EKF look worse than it should *for this
-reason* rather than because of linearization error per se).
-
-*Recommendation:* either compute the Jacobian of the RK4 step (chain rule
-through the four stages), or use the same first-order map for *both* `f` and
-`F_jac` so they are at least mutually consistent.
+*Was a design-limitation; fixed.* The standard `LorenzBenchmark` now hands EKF/KF
+the **exact Jacobian of the 4-stage RK4 map** (chain rule through the four stages,
+[lorenz.py](lorenz.py)), so the covariance is propagated with the same `O(dt⁴)`
+accuracy as the RK4 mean `f` — mean and covariance are integration-order
+consistent, and the verification matches a finite-difference Jacobian of `f` to
+~1e-9. The old first-order `F = I + dt·J` linearization is retained only as the
+explicitly-labelled `LorenzFEABenchmark` (`lorenz_fea`) baseline, so the cost of
+the inconsistency can still be measured rather than silently shipped.
 
 ## 2. Pendulum ground truth is forward-Euler — [design-limitation]
 
@@ -101,8 +87,8 @@ and report RMSE as a curve, not a single point.
 
 | # | Issue | Tag | Where |
 |---|-------|-----|-------|
-| 1 | Lorenz `F_jac` Euler-order while `f` is RK4 | design-limitation | lorenz.py:158 vs 169 |
+| 1 | Lorenz `F_jac` Euler-order while `f` is RK4 | resolved (exact RK4 Jacobian; FEA kept as `lorenz_fea` baseline) | lorenz.py |
 | 2 | Pendulum ground truth is forward-Euler | design-limitation | pendulum.py:37 |
 | 3 | `dt` argument overloaded as time index `t` | debatable-choice | nonlinear.py:34,97 |
-| 4 | `±1e3` clip shapes a diverging filter's RMSE | valid-as-is (caveat) | lorenz.py:148,159 |
-| 5 | One fixed operating point per level | debatable-choice | all four levels |
+| 4 | `±1e3` clip shapes a diverging filter's RMSE | valid-as-is (caveat) | lorenz.py |
+| 5 | One fixed operating point per level | debatable-choice | all levels |

@@ -1,7 +1,8 @@
 # state_benchmark
 
 State-space estimation benchmark: synthetic systems → noisy observations →
-classical/neural filters → RMSE/runtime/memory metrics → plots.
+classical/neural filters → per-variable RMSE + uncertainty (NEES/NLL) + runtime
+metrics → plots.
 
 ```
 benchmark_levels/  generates (states, observations) per system, defines FilterModel
@@ -10,11 +11,36 @@ benchmark_levels/  generates (states, observations) per system, defines FilterMo
 estimators/        consumes y_t, produces x̂_t   (never sees x_t)
         │
         ▼
-metrics/           compute_rmse(x̂_t, x_t), runtime_per_step_ms, measure_memory
+metrics/           compute_rmse_per_dim(x̂_t, x_t, names), compute_nees/nll, runtime_per_step_ms
         │
         ▼
-visualization/     plot_trajectory / plot_rmse_comparison / plot_runtime_comparison
+visualization/     plot_trajectory / plot_rmse_comparison_per_dim / plot_runtime_comparison
 ```
+
+## Architectural rules
+
+These are enforced in code, not just conventions:
+
+- **Fail fast and loud.** No silent fallbacks, implicit type coercions, or dummy
+  returns (no `0.0`/`NaN`/`None` for an undefined result). Invalid inputs,
+  mismatched arrays, or a scientifically unsound configuration raise a
+  descriptive `ValueError`/`RuntimeError`/`ImportError` immediately.
+- **Strict Numba.** The classical filters (KF/EKF/UKF) run *exclusively* on the
+  custom `@njit` kernels (plus the third-party `filterpy` reference filters).
+  There is no pure-NumPy fallback; a missing numba raises `ImportError` at
+  import time.
+- **Linear KF only on linear models.** `KalmanFilterEstimator` asserts its model
+  is linear (`f(x)=F@x`, `h(x)=H@x`) on every `estimate()` and refuses to run on
+  a nonlinear system (it does not silently linearize at the origin). Use
+  EKF/UKF/PF for nonlinear levels.
+- **KalmanNet hardware split.** Training/validation run fully vectorized and
+  batched on the GPU; test-time `estimate()` runs strictly sequentially on the
+  CPU (microprocessor-deployment simulation).
+- **No pooled RMSE.** RMSE is reported per named physical state variable
+  (`x,y,z` for Lorenz; `θ,ω` for pendulum); the single scalar across mixed
+  dimensions has been removed. Uncertainty is scored with NEES/NLL.
+- **Memory metric disabled.** `metrics.measure_memory()` raises
+  `NotImplementedError` (whole-process RSS was meaningless per-estimator).
 
 Glue layers, documented inline rather than with their own README (read the
 module directly):
@@ -29,10 +55,12 @@ module directly):
 ## Module docs (mathematical models, noise vs. state)
 
 - [benchmark_levels/README.md](benchmark_levels/README.md) — `x_{t+1}=f(x_t,t)+w_t`,
-  `y_t=h(x_t)+v_t` for linear / nonlinear / pendulum / lorenz.
+  `y_t=h(x_t)+v_t` for linear / nonlinear / pendulum / lorenz (+ `lorenz_fea`,
+  the forward-Euler-Jacobian baseline).
 - [estimators/README.md](estimators/README.md) — KF/EKF/UKF/PF update equations,
   KalmanNet's learned-gain formulation, filterpy reference filters.
-- [metrics/README.md](metrics/README.md) — RMSE/latency/runtime/memory formulas.
+- [metrics/README.md](metrics/README.md) — per-variable RMSE, NEES/NLL,
+  latency/runtime formulas.
 - [visualization/README.md](visualization/README.md) — plot ↔ metric/array contract.
 
 `summary.md` is the consolidated mathematical reference (every equation with a
