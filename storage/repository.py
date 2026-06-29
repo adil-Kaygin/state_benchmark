@@ -36,22 +36,24 @@ class ExperimentRepository:
         )  
         self._db.commit()  
   
-    def save_metrics(  
-        self,  
-        experiment_id: str,  
-        rmse: float,  
-        runtime_seconds: float,  
-        runtime_per_step_ms: float,  
-        memory_mb: Optional[float],  
-    ) -> None:  
-        self._db.execute(  
-            """  
-            INSERT INTO metrics (experiment_id, rmse, runtime_seconds, runtime_per_step_ms, memory_mb)  
-            VALUES (?, ?, ?, ?, ?)  
-            """,  
-            (experiment_id, rmse, runtime_seconds, runtime_per_step_ms, memory_mb),  
-        )  
-        self._db.commit()  
+    def save_metrics(
+        self,
+        experiment_id: str,
+        rmse_per_dim_json: str,
+        runtime_seconds: float,
+        runtime_per_step_ms: float,
+    ) -> None:
+        # rmse_per_dim_json is a JSON object {state_var: rmse}. The single
+        # pooled-scalar `rmse` column and the whole-process `memory_mb` column
+        # have been removed (see metrics/ overhaul).
+        self._db.execute(
+            """
+            INSERT INTO metrics (experiment_id, rmse_per_dim, runtime_seconds, runtime_per_step_ms)
+            VALUES (?, ?, ?, ?)
+            """,
+            (experiment_id, rmse_per_dim_json, runtime_seconds, runtime_per_step_ms),
+        )
+        self._db.commit()
   
     def save_artifact(  
         self,  

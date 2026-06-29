@@ -71,21 +71,25 @@ class LinearBenchmark(BenchmarkLevel):
     def description(self) -> str:  
         return "Linear constant-velocity state estimation benchmark."  
   
-    @property  
-    def state_dimension(self) -> int:  
-        return 2  
-  
-    @property  
-    def observation_dimension(self) -> int:  
-        return 1  
-  
-    def generate_dataset(self, output_dir: Path) -> None:  
-        from datasets.schema import DatasetMetadata  
-        from datasets.hdf5_writer import HDF5Writer  
-  
-        rng = np.random.default_rng(self._random_seed)  
-        output_dir.mkdir(parents=True, exist_ok=True)  
-        simulator = LinearSimulator(self._F, self._H, self._Q, self._R, rng=rng)  
+    @property
+    def state_dimension(self) -> int:
+        return 2
+
+    @property
+    def observation_dimension(self) -> int:
+        return 1
+
+    @property
+    def state_names(self) -> tuple[str, ...]:
+        return ("position", "velocity")
+
+    def generate_dataset(self, output_dir: Path) -> None:
+        from datasets.schema import DatasetMetadata
+        from datasets.hdf5_writer import HDF5Writer
+
+        rng = np.random.default_rng(self._random_seed)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        simulator = LinearSimulator(self._F, self._H, self._Q, self._R, rng=rng)
   
         splits = {  
             "train": int(self._num_trajectories * 0.7),  

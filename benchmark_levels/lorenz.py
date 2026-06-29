@@ -122,6 +122,10 @@ class _BaseLorenzBenchmark(BenchmarkLevel):
     def observation_dimension(self) -> int:
         return 2
 
+    @property
+    def state_names(self) -> tuple[str, ...]:
+        return ("x", "y", "z")
+
     def generate_dataset(self, output_dir: Path) -> None:
         from datasets.schema import DatasetMetadata
         from datasets.hdf5_writer import HDF5Writer

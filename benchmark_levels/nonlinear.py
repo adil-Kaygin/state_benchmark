@@ -62,21 +62,25 @@ class NonlinearBenchmark(BenchmarkLevel):
     def description(self) -> str:  
         return "Strongly nonlinear scalar state estimation benchmark (Gordon et al. 1993)."  
   
-    @property  
-    def state_dimension(self) -> int:  
-        return 1  
-  
-    @property  
-    def observation_dimension(self) -> int:  
-        return 1  
-  
-    def generate_dataset(self, output_dir: Path) -> None:  
-        from datasets.schema import DatasetMetadata  
-        from datasets.hdf5_writer import HDF5Writer  
-  
-        rng = np.random.default_rng(self._random_seed)  
-        output_dir.mkdir(parents=True, exist_ok=True)  
-        simulator = NonlinearSimulator(self._Q, self._R, rng=rng)  
+    @property
+    def state_dimension(self) -> int:
+        return 1
+
+    @property
+    def observation_dimension(self) -> int:
+        return 1
+
+    @property
+    def state_names(self) -> tuple[str, ...]:
+        return ("x",)
+
+    def generate_dataset(self, output_dir: Path) -> None:
+        from datasets.schema import DatasetMetadata
+        from datasets.hdf5_writer import HDF5Writer
+
+        rng = np.random.default_rng(self._random_seed)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        simulator = NonlinearSimulator(self._Q, self._R, rng=rng)
   
         splits = {  
             "train": int(self._num_trajectories * 0.7),  

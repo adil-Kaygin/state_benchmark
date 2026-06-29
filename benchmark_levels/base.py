@@ -74,15 +74,24 @@ class BenchmarkLevel(ABC):
     def description(self) -> str:  
         pass  
   
-    @property  
-    @abstractmethod  
-    def state_dimension(self) -> int:  
-        pass  
-  
-    @property  
-    @abstractmethod  
-    def observation_dimension(self) -> int:  
-        pass  
+    @property
+    @abstractmethod
+    def state_dimension(self) -> int:
+        pass
+
+    @property
+    @abstractmethod
+    def observation_dimension(self) -> int:
+        pass
+
+    @property
+    @abstractmethod
+    def state_names(self) -> tuple[str, ...]:
+        """Physical names of each state dimension, e.g. ('x', 'y', 'z') for
+        Lorenz or ('theta', 'omega') for the pendulum. len == state_dimension.
+        Used by metrics/visualization to label per-dimension RMSE with the real
+        physical variable instead of a generic integer index."""
+        pass
   
     @abstractmethod  
     def generate_dataset(self, output_dir: Path) -> None:  

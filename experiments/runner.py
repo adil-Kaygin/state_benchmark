@@ -1,9 +1,9 @@
 from __future__ import annotations  
   
+import json
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -11,8 +11,7 @@ from .config import ExperimentConfig
 from .result import ExperimentResult
 from estimators.base import BaseEstimator
 from datasets.schema import TrajectoryDataset
-from metrics.rmse import compute_rmse
-from metrics.memory import measure_memory
+from metrics.rmse import compute_rmse_per_dim
 from metrics.runtime import runtime_per_step_ms as _runtime_per_step_ms
 from storage.repository import ExperimentRepository
 
@@ -61,29 +60,31 @@ class ExperimentRunner:
             N = int(_to_numpy(test_dataset.states).shape[0])
             T = int(_to_numpy(test_dataset.timestamps).shape[0])
             runtime_per_step_ms = _runtime_per_step_ms(runtime_seconds, N * T)
-  
-            estimates_np = _to_numpy(estimates)  
-            targets_np = _to_numpy(test_dataset.states)  
-            rmse = compute_rmse(estimates=estimates_np, targets=targets_np)  
-            memory_mb = measure_memory()  
-  
-            result = ExperimentResult(  
-                experiment_id=experiment_id,  
-                benchmark_name=config.benchmark_name,  
-                estimator_name=config.estimator_name,  
-                rmse=rmse,  
-                runtime_seconds=runtime_seconds,  
-                runtime_per_step_ms=runtime_per_step_ms,  
-                memory_mb=memory_mb,  
-            )  
-  
-            self._repository.save_metrics(  
-                experiment_id=experiment_id,  
-                rmse=rmse,  
-                runtime_seconds=runtime_seconds,  
-                runtime_per_step_ms=runtime_per_step_ms,  
-                memory_mb=memory_mb,  
-            )  
+
+            estimates_np = _to_numpy(estimates)
+            targets_np = _to_numpy(test_dataset.states)
+            # RMSE per named physical state variable -- the pooled scalar RMSE
+            # has been removed. Memory tracking has likewise been removed (see
+            # metrics/memory.py); it is no longer recorded.
+            rmse_per_dim = compute_rmse_per_dim(
+                estimates_np, targets_np, config.state_names
+            )
+
+            result = ExperimentResult(
+                experiment_id=experiment_id,
+                benchmark_name=config.benchmark_name,
+                estimator_name=config.estimator_name,
+                rmse_per_dim=rmse_per_dim,
+                runtime_seconds=runtime_seconds,
+                runtime_per_step_ms=runtime_per_step_ms,
+            )
+
+            self._repository.save_metrics(
+                experiment_id=experiment_id,
+                rmse_per_dim_json=json.dumps(rmse_per_dim),
+                runtime_seconds=runtime_seconds,
+                runtime_per_step_ms=runtime_per_step_ms,
+            )
   
             if config.save_model:  
                 model_path = self._artifacts_dir / experiment_id / "model.json"  

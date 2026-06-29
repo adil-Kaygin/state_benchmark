@@ -16,7 +16,12 @@ def timer() -> Generator[dict, None, None]:
         result["elapsed_seconds"] = time.perf_counter() - start  
   
   
-def runtime_per_step_ms(total_seconds: float, num_steps: int) -> float:  
-    if num_steps <= 0:  
-        return 0.0  
+def runtime_per_step_ms(total_seconds: float, num_steps: int) -> float:
+    # Fail fast: a non-positive step count is an undefined latency, not an
+    # "infinitely fast" 0.0. Returning 0.0 here previously made an undefined
+    # case read as the best possible result.
+    if num_steps <= 0:
+        raise ValueError(
+            f"num_steps must be positive to compute per-step runtime; got {num_steps}."
+        )
     return (total_seconds / num_steps) * 1000.0
