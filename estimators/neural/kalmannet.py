@@ -16,11 +16,9 @@ if TYPE_CHECKING:
 
 class _KalmanGainGRU:
     """
-    Lazily-defined torch.nn.Module: a GRU-based recurrent gain estimator in
-    the spirit of KalmanNet (Revach et al., 2022) and the reference
-    `kalman_net_sim2real.py` script, but generalized over an arbitrary
-    (nx, ny) state/observation dimension pair via the benchmark's
-    `FilterModel.f` / `FilterModel.h` instead of a fixed IMU kinematic prior.
+    Generalized over an arbitrary (nx, ny) state/observation dimension pair 
+    via the benchmark's `FilterModel.f` / `FilterModel.h` instead of a fixed 
+    IMU kinematic prior.
 
     Predict step (every timestep): x_pred = f(x_prev)  -- supplied by the
     benchmark's process model, run outside the network.
