@@ -7,26 +7,25 @@ Kept in a dedicated module (rather than one monolithic filter file) so each
 estimator file stays focused on its own contract implementation while the
 hot inner loops live next to each other for easy comparison/maintenance.
 
-Numba is an optional accelerator: every estimator falls back to a pure-NumPy
-loop when numba is not installed, so the framework has no hard dependency on it.
+Numba is a HARD dependency of the classical filters. There is no pure-NumPy
+fallback: the entire benchmark relies exclusively on these @njit kernels (plus
+the third-party filterpy reference filters). Per the "fail fast and loud"
+architectural rule, if numba is missing or fails to import, this module raises
+ImportError at import time rather than silently degrading to slow/divergent
+NumPy code.
 """
-
-from typing import Tuple
 
 import numpy as np
 
 try:
     from numba import njit
-    NUMBA_AVAILABLE = True
-except ImportError:
-    NUMBA_AVAILABLE = False
-
-    def njit(*args, **kwargs):
-        def _decorator(func):
-            return func
-        if args and callable(args[0]) and not kwargs:
-            return args[0]
-        return _decorator
+except ImportError as exc:  # fail fast and loud -- no NumPy fallback
+    raise ImportError(
+        "numba is required for the classical filters (KF/EKF/UKF). The "
+        "pure-NumPy fallback has been removed; the benchmark relies exclusively "
+        "on the @njit kernels in estimators/classical/_numba_kernels.py. "
+        "Install numba (`pip install numba`) to run these estimators."
+    ) from exc
 
 
 # Ceiling on covariance magnitude. A KF/EKF whose model is a poor fit for a
@@ -69,26 +68,54 @@ def _robust_chol(M: np.ndarray, nx: int, I: np.ndarray) -> np.ndarray:
 
 
 def assert_linear_model(f, h, F: np.ndarray, H: np.ndarray, nx: int, ny: int) -> None:
-    """Raise ValueError unless f(x)=Fx and h(x)=Hx on a probe vector.
+    """Raise ValueError unless f(x)=F@x and h(x)=H@x exactly (a linear model).
 
-    kf_loop_batch/ukf_linear_loop hardcode the f(x)=Fx, h(x)=Hx assumption for
-    speed; silently enabling use_numba=True on a nonlinear FilterModel (e.g.
-    pendulum/lorenz/nonlinear) would linearize at the origin instead of
-    erroring, producing numbers that look like KF/UKF results but aren't.
+    The Kalman filter is the optimal estimator only for a linear-Gaussian model
+    and kf_loop_batch hardcodes the f(x)=F@x, h(x)=H@x assumption. Per the
+    "fail fast and loud" rule, running the KF on a nonlinear FilterModel (e.g.
+    pendulum/lorenz/nonlinear) must crash here rather than silently linearizing
+    at the origin and reporting numbers that look like KF results but aren't.
+
+    Linearity is probed at several points (including non-zero offsets) so a map
+    that only coincidentally agrees with F@x at the origin cannot slip through.
+    F/H shapes are validated too, since a wrong-shaped Jacobian is just as
+    invalid as a nonlinear one.
     """
-    rng = np.random.default_rng(0)
-    x_probe = rng.standard_normal(nx)
-    f_actual = np.asarray(f(x_probe))
-    f_linear = F @ x_probe
-    h_actual = np.asarray(h(x_probe))
-    h_linear = H @ x_probe
-    if not (np.allclose(f_actual, f_linear, atol=1e-8) and np.allclose(h_actual, h_linear, atol=1e-8)):
+    F = np.asarray(F, dtype=np.float64)
+    H = np.asarray(H, dtype=np.float64)
+    if F.shape != (nx, nx):
         raise ValueError(
-            "use_numba=True requires f(x)=F@x and h(x)=H@x (e.g. LinearBenchmark); "
-            "this FilterModel's f/h are nonlinear, so the fast numba path would "
-            "silently linearize at the origin instead of running the real filter. "
-            "Set use_numba=False for this benchmark."
+            f"KalmanFilter requires F with shape ({nx}, {nx}); got {F.shape}."
         )
+    if H.shape != (ny, nx):
+        raise ValueError(
+            f"KalmanFilter requires H with shape ({ny}, {nx}); got {H.shape}."
+        )
+
+    rng = np.random.default_rng(0)
+    # Probe at the origin, the canonical basis directions, and random points.
+    probes = [np.zeros(nx)]
+    for j in range(nx):
+        e = np.zeros(nx)
+        e[j] = 3.0
+        probes.append(e)
+    for _ in range(4):
+        probes.append(rng.standard_normal(nx) * 5.0)
+
+    for x_probe in probes:
+        f_actual = np.asarray(f(x_probe), dtype=np.float64)
+        h_actual = np.asarray(h(x_probe), dtype=np.float64)
+        if not (
+            np.allclose(f_actual, F @ x_probe, atol=1e-8)
+            and np.allclose(h_actual, H @ x_probe, atol=1e-8)
+        ):
+            raise ValueError(
+                "KalmanFilterEstimator requires a LINEAR model (f(x)=F@x and "
+                "h(x)=H@x exactly, e.g. LinearBenchmark). This FilterModel's "
+                "f/h are nonlinear, so a Kalman filter would silently linearize "
+                "at the origin instead of running a valid filter. Use EKF/UKF/PF "
+                "for nonlinear systems."
+            )
 
 
 @njit(cache=True, fastmath=True)
@@ -104,9 +131,8 @@ def kf_loop(
     """Linear Kalman filter over a single trajectory. Returns estimates [T, nx].
 
     x0/P0 must be the benchmark's generative prior (FilterModel.x0_mean/x0_cov),
-    not a hardcoded zeros/identity default -- otherwise this diverges from the
-    pure-NumPy/EKF paths, which do use the real prior, and KF/EKF/UKF stop being
-    a fair comparison on the same dataset.
+    not a hardcoded zeros/identity default -- otherwise KF/EKF/UKF would stop
+    being a fair comparison on the same dataset (EKF/UKF also use the real prior).
     """
     T, ny = observations.shape
     nx = Q.shape[0]
@@ -166,10 +192,10 @@ def ekf_loop(
     """General (nonlinear) EKF over one trajectory, JIT-compiled.
 
     f/h/Fj/Hj are themselves @njit functions supplied by the benchmark
-    (FilterModel.numba_dynamics); numba's first-class-function support lets
-    them be passed into and called from this compiled loop, so the EKF runs
-    fully in machine code instead of the pure-Python loop in ekf.py. The math
-    is identical to that fallback -- this is purely an inference accelerator.
+    (FilterModel.numba); numba's first-class-function support lets them be
+    passed into and called from this compiled loop, so the EKF runs fully in
+    machine code. This is the sole EKF implementation -- there is no pure-Python
+    fallback.
     """
     T, ny = observations.shape
     nx = Q.shape[0]
@@ -231,10 +257,9 @@ def ukf_loop(
 ) -> np.ndarray:
     """General (nonlinear) UKF over one trajectory, JIT-compiled.
 
-    Unlike ukf_linear_loop (which bakes in f(x)=Fx, h(x)=Hx and so only fits
-    LinearBenchmark), this propagates each sigma point through the benchmark's
-    own @njit f/h, so it is correct for pendulum/nonlinear/lorenz too. Numbers
-    match the pure-NumPy UKF in ukf.py to fastmath tolerance.
+    Propagates each sigma point through the benchmark's own @njit f/h, so it is
+    correct for every level (linear/pendulum/nonlinear/lorenz). This is the
+    sole UKF implementation -- there is no pure-NumPy fallback.
     """
     T, ny = observations.shape
     nx = Q.shape[0]
@@ -332,132 +357,3 @@ def ukf_loop_batch(
         )
     return estimates
 
-
-def ukf_sigma_points(
-    x: np.ndarray, P: np.ndarray, nx: int, alpha: float, beta: float, kappa: float
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Plain-NumPy sigma point generator, reused by the (non-jitted) UKF
-    estimator since sigma points require calling arbitrary Python f()/h()
-    callables from FilterModel, which numba cannot compile generically."""
-    lam = alpha ** 2 * (nx + kappa) - nx
-    try:
-        L = np.linalg.cholesky((nx + lam) * P)
-    except np.linalg.LinAlgError:
-        L = np.linalg.cholesky((nx + lam) * (P + 1e-6 * np.eye(nx)))
-
-    pts = np.zeros((2 * nx + 1, nx))
-    pts[0] = x
-    for j in range(nx):
-        pts[j + 1] = x + L[:, j]
-        pts[nx + j + 1] = x - L[:, j]
-
-    Wm = np.full(2 * nx + 1, 1.0 / (2.0 * (nx + lam)))
-    Wc = np.full(2 * nx + 1, 1.0 / (2.0 * (nx + lam)))
-    Wm[0] = lam / (nx + lam)
-    Wc[0] = lam / (nx + lam) + (1.0 - alpha ** 2 + beta)
-
-    return pts, Wm, Wc
-
-
-@njit(cache=True, fastmath=True)
-def ukf_linear_loop(
-    F: np.ndarray,
-    H: np.ndarray,
-    Q: np.ndarray,
-    R: np.ndarray,
-    observations: np.ndarray,  # [T, ny]
-    alpha: float,
-    beta: float,
-    kappa: float,
-    x0: np.ndarray,  # [nx]
-    P0: np.ndarray,  # [nx, nx]
-) -> np.ndarray:
-    """Fast UKF path for benchmarks whose f/h are linear (f(x)=Fx, h(x)=Hx),
-    e.g. LinearBenchmark. Runs the full sigma-point machinery under njit
-    since F/H are constant matrices rather than arbitrary Python callables.
-
-    x0/P0 must be the benchmark's generative prior -- see kf_loop's docstring
-    for why a hardcoded zeros/identity default would make this path diverge
-    from the pure-NumPy UKF/EKF on the same dataset.
-    """
-    T, ny = observations.shape
-    nx = Q.shape[0]
-    n_sig = 2 * nx + 1
-
-    lam = alpha * alpha * (nx + kappa) - nx
-    c = nx + lam
-    Wm = np.empty(n_sig)
-    Wc = np.empty(n_sig)
-    Wm[0] = lam / c
-    Wc[0] = lam / c + (1.0 - alpha * alpha + beta)
-    for i in range(1, n_sig):
-        Wm[i] = 1.0 / (2.0 * c)
-        Wc[i] = 1.0 / (2.0 * c)
-
-    estimates = np.zeros((T, nx))
-    x = x0.copy()
-    P = P0.copy()
-    I = np.eye(nx)
-
-    for t in range(T):
-        P = 0.5 * (P + P.T)
-        M = c * P
-        try:
-            sqrtP = np.linalg.cholesky(M)
-        except Exception:
-            sqrtP = _robust_chol(M, nx, I)
-        sigmas = np.empty((n_sig, nx))
-        sigmas[0] = x
-        for i in range(nx):
-            col = sqrtP[:, i]
-            sigmas[i + 1] = x + col
-            sigmas[nx + i + 1] = x - col
-
-        sig_f = np.empty((n_sig, nx))
-        for i in range(n_sig):
-            sig_f[i] = F @ sigmas[i]
-
-        x_pred = np.zeros(nx)
-        for i in range(n_sig):
-            x_pred += Wm[i] * sig_f[i]
-        P_pred = Q.copy()
-        for i in range(n_sig):
-            d = sig_f[i] - x_pred
-            P_pred += Wc[i] * np.outer(d, d)
-
-        P_pred = 0.5 * (P_pred + P_pred.T)
-        Mp = c * P_pred
-        try:
-            sqrtPp = np.linalg.cholesky(Mp)
-        except Exception:
-            sqrtPp = _robust_chol(Mp, nx, I)
-        sig2 = np.empty((n_sig, nx))
-        sig2[0] = x_pred
-        for i in range(nx):
-            col = sqrtPp[:, i]
-            sig2[i + 1] = x_pred + col
-            sig2[nx + i + 1] = x_pred - col
-
-        sig_h = np.empty((n_sig, ny))
-        for i in range(n_sig):
-            sig_h[i] = H @ sig2[i]
-
-        y_pred = np.zeros(ny)
-        for i in range(n_sig):
-            y_pred += Wm[i] * sig_h[i]
-
-        S = R.copy()
-        Pxy = np.zeros((nx, ny))
-        for i in range(n_sig):
-            dy = sig_h[i] - y_pred
-            dx = sig2[i] - x_pred
-            S += Wc[i] * np.outer(dy, dy)
-            Pxy += Wc[i] * np.outer(dx, dy)
-
-        K = Pxy @ np.linalg.inv(S)
-        x = x_pred + K @ (observations[t] - y_pred)
-        P = P_pred - K @ S @ K.T
-        P = 0.5 * (P + P.T)  # keep symmetric against numerical drift
-        estimates[t] = x
-
-    return estimates
