@@ -45,11 +45,16 @@ class _KalmanGainGRU:
             def __init__(self) -> None:
                 super().__init__()
                 in_features = ny + nx  # innovation + previous correction
-                self.gru = nn.GRU(
+                # GRUCell (single-step) instead of nn.GRU on a seq-len-1 input:
+                # the time recurrence is driven explicitly by the Python loop in
+                # the callers, so we only ever advance one step at a time. This
+                # avoids the seq-length plumbing (unsqueeze/squeeze) and the
+                # heavier nn.GRU launch per timestep. Numerically identical: a
+                # single-layer nn.GRU step and an nn.GRUCell step compute the
+                # same GRU recurrence.
+                self.gru = nn.GRUCell(
                     input_size=in_features,
                     hidden_size=hidden_size,
-                    num_layers=1,
-                    batch_first=True,
                 )
                 self.out_norm = nn.LayerNorm(hidden_size)
                 self.fc_gain = nn.Sequential(
@@ -78,21 +83,26 @@ class _KalmanGainGRU:
 
             def step(self, innovation, dx_prev, h):
                 """
-                innovation: (B, ny), dx_prev: (B, nx), h: (1, B, hidden_size)
-                Returns (K, log_var_or_None, h_next).
+                innovation: (B, ny), dx_prev: (B, nx), h: (B, hidden_size)
+                Returns (K, out, h_next) where `out` is the post-out_norm GRU
+                output (B, hidden_size).
+
+                The auxiliary log-variance head is deliberately NOT applied here:
+                it does not feed back into the recurrence, so the callers collect
+                `out` per step and apply fc_logvar once on the stacked sequence.
+                Only fc_gain (which advances x via K) runs inside the loop.
                 """
-                inp = torch.cat([innovation, dx_prev], dim=1).unsqueeze(1)
-                out, h_next = self.gru(inp, h)
-                out = self.out_norm(out.squeeze(1))
+                inp = torch.cat([innovation, dx_prev], dim=1)
+                h_next = self.gru(inp, h)
+                out = self.out_norm(h_next)
 
                 K_flat = self.fc_gain(out)
                 K = K_flat.view(-1, self.nx, self.ny)
 
-                log_var = self.fc_logvar(out) if self.predict_log_var else None
-                return K, log_var, h_next
+                return K, out, h_next
 
             def init_hidden(self, batch_size: int, device) -> "torch.Tensor":
-                return torch.zeros(1, batch_size, self.hidden_size, device=device)
+                return torch.zeros(batch_size, self.hidden_size, device=device)
 
         return _Module()
 
@@ -145,6 +155,7 @@ class KalmanNetEstimator(BaseEstimator):
         min_lr: float = 1e-6,
         early_stopping_patience: Optional[int] = None,
         early_stopping_min_delta: float = 0.0,
+        compile_model: bool = False,
         verbose: bool = True,
     ) -> None:
         self._model = filter_model
@@ -164,6 +175,9 @@ class KalmanNetEstimator(BaseEstimator):
         self._min_lr = min_lr
         self._early_stopping_patience = early_stopping_patience
         self._early_stopping_min_delta = early_stopping_min_delta
+        # Opt-in torch.compile of the per-step GRU body for the training/val
+        # forward pass only. Never applied to the CPU inference path.
+        self._compile = compile_model
         self._verbose = verbose
         self._network = None
         self._best_val_loss = float("inf")
@@ -254,7 +268,12 @@ class KalmanNetEstimator(BaseEstimator):
         x_pred_prev = x.clone()
         h = network.init_hidden(B, device)
 
-        estimates, log_vars = [], []
+        predict_log_var = network.predict_log_var
+        # Use the torch.compile'd per-step body if fit() prepared one (training/
+        # val only); fall back to the eager step otherwise (e.g. CPU path never
+        # sets this attribute).
+        step = getattr(network, "_compiled_step", None) or network.step
+        estimates, outs = [], []
         for t in range(T):
             t_val = float(timestamps[t])
             x_pred = _torch_batch_step(torch_f, x, t_val)
@@ -263,7 +282,7 @@ class KalmanNetEstimator(BaseEstimator):
             innovation = observations[:, t, :] - y_pred
             dx_prev = x - x_pred_prev
 
-            K, log_var, h = network.step(innovation, dx_prev, h)
+            K, out, h = step(innovation, dx_prev, h)
             correction = torch.bmm(K, innovation.unsqueeze(2)).squeeze(2)
             x_post = x_pred + correction
 
@@ -271,11 +290,17 @@ class KalmanNetEstimator(BaseEstimator):
             x = x_post
 
             estimates.append(x_post)
-            if log_var is not None:
-                log_vars.append(log_var)
+            if predict_log_var:
+                outs.append(out)
 
         estimates_seq = torch.stack(estimates, dim=1)
-        log_var_seq = torch.stack(log_vars, dim=1) if log_vars else None
+        # fc_logvar is applied ONCE on the stacked [B, T, hidden] sequence rather
+        # than T times inside the loop -- it never feeds back into the recurrence.
+        if predict_log_var:
+            out_seq = torch.stack(outs, dim=1)  # [B, T, hidden]
+            log_var_seq = network.fc_logvar(out_seq)  # [B, T, nx]
+        else:
+            log_var_seq = None
         return estimates_seq, log_var_seq
 
     def fit(self, train_dataset: "TrajectoryDataset", val_dataset: "TrajectoryDataset") -> None:
@@ -286,6 +311,19 @@ class KalmanNetEstimator(BaseEstimator):
         torch.manual_seed(self._random_seed)
         device = self._training_device()
         network = self._ensure_network().to(device)
+
+        # Opt-in torch.compile of the per-step body (training/val forward only).
+        # We compile network.step and stash it as `_compiled_step`; the vectorized
+        # path picks it up when present. No-op on torch builds without compile,
+        # and never set on the CPU inference path (fit() clears it before the
+        # network is moved to CPU). Numerically identical -- compile only fuses
+        # kernels, it does not change the computation.
+        network._compiled_step = None
+        if self._compile and hasattr(torch, "compile"):
+            try:
+                network._compiled_step = torch.compile(network.step)
+            except Exception:
+                network._compiled_step = None
 
         train_obs = torch.as_tensor(np.asarray(train_dataset.observations), dtype=torch.float32)
         train_states = torch.as_tensor(np.asarray(train_dataset.states), dtype=torch.float32)
@@ -409,6 +447,8 @@ class KalmanNetEstimator(BaseEstimator):
         if self._best_state_dict is not None:
             network.load_state_dict(self._best_state_dict)
 
+        # Drop the compiled step so the CPU inference path uses the eager step.
+        network._compiled_step = None
         self._network = network.to("cpu")
 
     def _run_sequence_sequential_cpu(self, network, observations, timestamps):
@@ -455,7 +495,7 @@ class KalmanNetEstimator(BaseEstimator):
                 innovation = observations[i, t, :].unsqueeze(0) - y_pred
                 dx_prev = x - x_pred_prev
 
-                K, log_var, hidden = network.step(innovation, dx_prev, hidden)
+                K, out, hidden = network.step(innovation, dx_prev, hidden)
                 correction = torch.bmm(K, innovation.unsqueeze(2)).squeeze(2)
                 x_post = x_pred + correction
 
@@ -463,7 +503,11 @@ class KalmanNetEstimator(BaseEstimator):
                 x = x_post
 
                 all_estimates[i, t] = x_post.squeeze(0)
-                if all_log_vars is not None and log_var is not None:
+                # Embedded sim keeps per-step logvar; step() no longer computes it
+                # (it now returns the post-norm GRU output), so apply fc_logvar
+                # here on this single step -- numerically identical to before.
+                if all_log_vars is not None and network.predict_log_var:
+                    log_var = network.fc_logvar(out)
                     all_log_vars[i, t] = log_var.squeeze(0)
 
         return all_estimates, all_log_vars
