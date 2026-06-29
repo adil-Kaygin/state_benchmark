@@ -29,6 +29,26 @@ class NumbaDynamics:
 
 
 @dataclass
+class TorchDynamics:
+    """Batched, GPU-friendly torch versions of a FilterModel's f/h.
+
+    f/h here take a batched state tensor [B, nx] (and a scalar timestep t) and
+    return [B, nx] / [B, ny] entirely with torch tensor ops on the input's
+    device -- no per-row Python loop, no NumPy round-trip. They exist so
+    KalmanNet's predict step can run fully vectorized on the GPU during
+    training/validation (the classical filters do not use these; they use the
+    @njit NumbaDynamics on CPU).
+
+    The math MUST match the FilterModel's NumPy f/h one-for-one so that the
+    GPU-trained network and the CPU sequential estimate() see the same process
+    model. Convention:
+      f(x, t) -> [B, nx]   h(x, t) -> [B, ny]
+    """
+    f: Callable
+    h: Callable
+
+
+@dataclass
 class FilterModel:
     f: Callable
     h: Callable
@@ -38,9 +58,14 @@ class FilterModel:
     R: np.ndarray
     x0_mean: Optional[np.ndarray] = None
     x0_cov: Optional[np.ndarray] = None
-    # Optional @njit dynamics for the CPU-optimized filter kernels. None for
-    # levels that don't provide them (filters then use the numpy fallback).
+    # @njit dynamics for the CPU-optimized classical filter kernels. The
+    # classical filters require this (there is no NumPy fallback); only levels
+    # consumed solely by neural estimators may leave it None.
     numba: Optional[NumbaDynamics] = None
+    # Optional batched-torch dynamics used by KalmanNet for vectorized GPU
+    # training. None for levels that don't provide them (KalmanNet then cannot
+    # train those levels on GPU and says so loudly).
+    torch: Optional["TorchDynamics"] = None
   
   
 class BaseSimulator(ABC):  

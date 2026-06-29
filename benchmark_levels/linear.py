@@ -8,6 +8,7 @@ import numpy as np
   
 from .base import BenchmarkLevel, BaseSimulator, FilterModel, NumbaDynamics
 from ._numba_dynamics import build_linear_numba_dynamics
+from ._torch_dynamics import build_linear_torch_dynamics
   
   
 class LinearSimulator(BaseSimulator):  
@@ -143,4 +144,5 @@ class LinearBenchmark(BenchmarkLevel):
             Q=self._Q.copy(), R=self._R.copy(),
             x0_mean=np.zeros(2), x0_cov=np.eye(2) * self._initial_state_var,
             numba=build_linear_numba_dynamics(F_mat, H_mat),
+            torch=build_linear_torch_dynamics(F_mat, H_mat),
         )

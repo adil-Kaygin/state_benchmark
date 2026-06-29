@@ -8,6 +8,7 @@ import numpy as np
   
 from .base import BenchmarkLevel, BaseSimulator, FilterModel
 from ._numba_dynamics import build_pendulum_numba_dynamics
+from ._torch_dynamics import build_pendulum_torch_dynamics
   
   
 class PendulumSimulator(BaseSimulator):  
@@ -159,4 +160,5 @@ class PendulumBenchmark(BenchmarkLevel):
             Q=self._Q.copy(), R=self._R.copy(),
             x0_mean=np.zeros(2), x0_cov=x0_cov,
             numba=build_pendulum_numba_dynamics(g, length, dt),
+            torch=build_pendulum_torch_dynamics(g, length, dt),
         )

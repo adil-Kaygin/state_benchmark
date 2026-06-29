@@ -1,4 +1,4 @@
-from .base import BenchmarkLevel, BaseSimulator, FilterModel, NumbaDynamics
+from .base import BenchmarkLevel, BaseSimulator, FilterModel, NumbaDynamics, TorchDynamics
 from .linear import LinearBenchmark
 from .pendulum import PendulumBenchmark
 from .lorenz import LorenzBenchmark, LorenzFEABenchmark
@@ -17,6 +17,7 @@ __all__ = [
     "BaseSimulator",
     "FilterModel",
     "NumbaDynamics",
+    "TorchDynamics",
     "LinearBenchmark",
     "PendulumBenchmark",
     "LorenzBenchmark",

@@ -97,16 +97,13 @@ class _KalmanGainGRU:
         return _Module()
 
 
-def _process_model_step(f, x_batch: "torch.Tensor", t: float = 0.0) -> "torch.Tensor":
-    """Apply a benchmark's (possibly nonlinear, NumPy-based) process model
-    f(x, t) row-wise to a batch of state vectors on the CPU. KalmanNet's
-    predict step intentionally reuses the benchmark's own dynamics (matching
-    the LLD's FilterModel contract) rather than learning them from scratch."""
-    import torch
-
-    x_np = x_batch.detach().cpu().numpy()
-    out = np.stack([f(x_np[i], t) for i in range(x_np.shape[0])], axis=0)
-    return torch.as_tensor(out, dtype=x_batch.dtype, device=x_batch.device)
+def _torch_batch_step(torch_fn, x_batch: "torch.Tensor", t: float = 0.0) -> "torch.Tensor":
+    """Apply a benchmark's BATCHED torch process model (FilterModel.torch.f/h)
+    to a batch of state vectors [B, nx] with a single vectorized tensor op on
+    the input's own device. No per-row Python loop, no NumPy round-trip -- this
+    is what lets KalmanNet's predict step run fully on the GPU during training.
+    The batched torch dynamics mirror the NumPy/numba f/h one-for-one."""
+    return torch_fn(x_batch, t)
 
 
 class KalmanNetEstimator(BaseEstimator):
@@ -117,9 +114,15 @@ class KalmanNetEstimator(BaseEstimator):
     architecture but generalized to arbitrary BenchmarkLevel state/obs
     dimensions instead of a fixed 6-dim IMU kinematic prior.
 
-    Training runs on GPU when available; estimate() always runs on CPU
-    (see `_cpu_inference_session`) so classical and neural estimators are
-    benchmarked under identical conditions.
+    Hardware-specific execution (deliberate, per the deployment model):
+    - fit()/validation: FULLY VECTORIZED, BATCHED torch on the GPU when
+      available. The predict step uses FilterModel.torch (batched torch f/h),
+      so every timestep is a single on-device tensor op -- no per-row Python
+      loop, no NumPy round-trip (`_run_sequence_vectorized`).
+    - estimate()/inference: STRICTLY SEQUENTIAL on the CPU -- one trajectory at
+      a time, one timestep at a time, using the NumPy f/h on a single state
+      vector (`_run_sequence_sequential_cpu`). This simulates microprocessor /
+      embedded deployment and measures test-time latency under those conditions.
     """
 
     estimator_id = "kalmannet"
@@ -221,14 +224,30 @@ class KalmanNetEstimator(BaseEstimator):
             )
         return self._network
 
-    def _run_sequence(self, network, observations, device, training: bool):
+    def _run_sequence_vectorized(self, network, observations, timestamps, device):
         """
-        Run the predict/update recursion over a batch of full trajectories.
+        VECTORIZED predict/update recursion over a batch of full trajectories,
+        used for GPU training/validation. Every timestep is a single batched
+        torch op on `device` (the batched FilterModel.torch.f/h plus the GRU);
+        there is no per-row Python loop and no NumPy round-trip, so the whole
+        forward pass stays on the GPU. The only loop is over the T timesteps,
+        which is the GRU's intrinsic recurrence (each step depends on the
+        previous corrected state) and cannot be removed for a sequential filter.
 
         observations: torch.Tensor [B, T, ny] on `device`.
+        timestamps:   torch.Tensor [T] (used for time-varying f, e.g. nonlinear).
         Returns (estimates [B, T, nx], log_vars [B, T, nx] or None).
         """
         import torch
+
+        if self._model.torch is None:
+            raise ValueError(
+                f"{self.estimator_name}.fit() needs FilterModel.torch (batched "
+                "torch dynamics) for vectorized GPU training; this model provides "
+                "none. Add a TorchDynamics to the level (see _torch_dynamics.py)."
+            )
+        torch_f = self._model.torch.f
+        torch_h = self._model.torch.h
 
         B, T, _ = observations.shape
         x = torch.zeros(B, self._nx, device=device, dtype=observations.dtype)
@@ -237,8 +256,9 @@ class KalmanNetEstimator(BaseEstimator):
 
         estimates, log_vars = [], []
         for t in range(T):
-            x_pred = _process_model_step(self._model.f, x, float(t))
-            y_pred = _process_model_step(self._model.h, x_pred)
+            t_val = float(timestamps[t])
+            x_pred = _torch_batch_step(torch_f, x, t_val)
+            y_pred = _torch_batch_step(torch_h, x_pred, t_val)
 
             innovation = observations[:, t, :] - y_pred
             dx_prev = x - x_pred_prev
@@ -271,6 +291,11 @@ class KalmanNetEstimator(BaseEstimator):
         train_states = torch.as_tensor(np.asarray(train_dataset.states), dtype=torch.float32)
         val_obs = torch.as_tensor(np.asarray(val_dataset.observations), dtype=torch.float32)
         val_states = torch.as_tensor(np.asarray(val_dataset.states), dtype=torch.float32)
+
+        # Timestamps are shared across all trajectories in a split; thread them
+        # into the (possibly time-varying) batched torch f during training.
+        train_ts = torch.as_tensor(np.asarray(train_dataset.timestamps), dtype=torch.float32)
+        val_ts = torch.as_tensor(np.asarray(val_dataset.timestamps), dtype=torch.float32)
 
         train_loader = DataLoader(
             TensorDataset(train_obs, train_states),
@@ -311,7 +336,7 @@ class KalmanNetEstimator(BaseEstimator):
                 obs_b = obs_b.to(device)
                 states_b = states_b.to(device)
 
-                pred, log_var = self._run_sequence(network, obs_b, device, training=True)
+                pred, log_var = self._run_sequence_vectorized(network, obs_b, train_ts, device)
                 loss = _loss(pred, log_var, states_b)
 
                 # Skip update if loss is NaN or Inf to prevent weight corruption
@@ -334,7 +359,7 @@ class KalmanNetEstimator(BaseEstimator):
                 for obs_b, states_b in val_loader:
                     obs_b = obs_b.to(device)
                     states_b = states_b.to(device)
-                    pred, log_var = self._run_sequence(network, obs_b, device, training=False)
+                    pred, log_var = self._run_sequence_vectorized(network, obs_b, val_ts, device)
                     val_loss_total += _loss(pred, log_var, states_b).item()
                     val_batches += 1
             val_loss = val_loss_total / max(val_batches, 1)
@@ -386,19 +411,80 @@ class KalmanNetEstimator(BaseEstimator):
 
         self._network = network.to("cpu")
 
+    def _run_sequence_sequential_cpu(self, network, observations, timestamps):
+        """
+        STRICTLY SEQUENTIAL, CPU-ONLY inference recursion used by estimate().
+
+        This deliberately simulates microprocessor / embedded deployment: the
+        filter runs one trajectory at a time, one timestep at a time, on the
+        CPU, using the benchmark's NumPy process model f/h (one state vector at
+        a time, no batching). It is the opposite of the vectorized GPU training
+        path on purpose -- test-time latency is measured under deployment-like
+        conditions, not under GPU batch throughput.
+
+        observations: torch.Tensor [N, T, ny] (on CPU).
+        Returns (estimates [N, T, nx], log_vars [N, T, nx] or None) as CPU tensors.
+        """
+        import torch
+
+        cpu = torch.device("cpu")
+        N, T, _ = observations.shape
+        f = self._model.f
+        h = self._model.h
+
+        all_estimates = torch.zeros(N, T, self._nx, dtype=observations.dtype, device=cpu)
+        all_log_vars = (
+            torch.zeros(N, T, self._nx, dtype=observations.dtype, device=cpu)
+            if self._predict_log_var else None
+        )
+
+        for i in range(N):  # one trajectory at a time
+            x = torch.zeros(1, self._nx, dtype=observations.dtype, device=cpu)
+            x_pred_prev = x.clone()
+            hidden = network.init_hidden(1, cpu)
+
+            for t in range(T):  # one timestep at a time
+                t_val = float(timestamps[t])
+                # NumPy process model, single state vector (microprocessor-style).
+                x_np = x.squeeze(0).numpy()
+                x_pred_np = np.asarray(f(x_np, t_val), dtype=np.float64)
+                y_pred_np = np.asarray(h(x_pred_np, t_val), dtype=np.float64)
+                x_pred = torch.from_numpy(x_pred_np).to(observations.dtype).unsqueeze(0)
+                y_pred = torch.from_numpy(y_pred_np).to(observations.dtype).unsqueeze(0)
+
+                innovation = observations[i, t, :].unsqueeze(0) - y_pred
+                dx_prev = x - x_pred_prev
+
+                K, log_var, hidden = network.step(innovation, dx_prev, hidden)
+                correction = torch.bmm(K, innovation.unsqueeze(2)).squeeze(2)
+                x_post = x_pred + correction
+
+                x_pred_prev = x_pred
+                x = x_post
+
+                all_estimates[i, t] = x_post.squeeze(0)
+                if all_log_vars is not None and log_var is not None:
+                    all_log_vars[i, t] = log_var.squeeze(0)
+
+        return all_estimates, all_log_vars
+
     def estimate(self, dataset: "TrajectoryDataset") -> np.ndarray:
         import torch
 
         if self._network is None:
             raise RuntimeError(f"{self.estimator_name} must be fit() before estimate().")
 
+        # Enforce CPU-only inference (microprocessor deployment simulation).
         network = self._network.to("cpu")
         network.eval()
 
-        observations = torch.as_tensor(np.asarray(dataset.observations), dtype=torch.float32)
+        observations = torch.as_tensor(
+            np.asarray(dataset.observations), dtype=torch.float32, device=torch.device("cpu")
+        )
+        timestamps = np.asarray(dataset.timestamps)
 
         with torch.inference_mode():
-            estimates, _ = self._run_sequence(network, observations, torch.device("cpu"), training=False)
+            estimates, _ = self._run_sequence_sequential_cpu(network, observations, timestamps)
 
         return estimates.numpy()
 
@@ -443,7 +529,10 @@ class KalmanNetUncertaintyEstimator(KalmanNetEstimator):
     _predict_log_var = True
 
     def estimate_with_uncertainty(self, dataset: "TrajectoryDataset"):
-        """Returns (estimates [N,T,nx], variance [N,T,nx])."""
+        """Returns (estimates [N,T,nx], variance [N,T,nx]).
+
+        Like estimate(), runs strictly sequentially on the CPU (deployment-like).
+        """
         import torch
 
         if self._network is None:
@@ -451,9 +540,12 @@ class KalmanNetUncertaintyEstimator(KalmanNetEstimator):
 
         network = self._network.to("cpu")
         network.eval()
-        observations = torch.as_tensor(np.asarray(dataset.observations), dtype=torch.float32)
+        observations = torch.as_tensor(
+            np.asarray(dataset.observations), dtype=torch.float32, device=torch.device("cpu")
+        )
+        timestamps = np.asarray(dataset.timestamps)
 
         with torch.inference_mode():
-            estimates, log_var = self._run_sequence(network, observations, torch.device("cpu"), training=False)
+            estimates, log_var = self._run_sequence_sequential_cpu(network, observations, timestamps)
 
         return estimates.numpy(), torch.exp(log_var).numpy()

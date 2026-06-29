@@ -11,6 +11,7 @@ from ._numba_dynamics import (
     build_lorenz_numba_dynamics,
     build_lorenz_fea_numba_dynamics,
 )
+from ._torch_dynamics import build_lorenz_torch_dynamics
 
 
 # The true Lorenz-63 attractor lives within roughly [-20,20]x[-25,25]x[0,50].
@@ -248,6 +249,7 @@ class LorenzBenchmark(_BaseLorenzBenchmark):
             Q=self._Q.copy(), R=self._R.copy(),
             x0_mean=np.array([0.0, 0.0, 25.0]), x0_cov=np.eye(3),
             numba=build_lorenz_numba_dynamics(sigma, rho, beta, dt),
+            torch=build_lorenz_torch_dynamics(sigma, rho, beta, dt),
         )
 
 
@@ -291,4 +293,5 @@ class LorenzFEABenchmark(_BaseLorenzBenchmark):
             Q=self._Q.copy(), R=self._R.copy(),
             x0_mean=np.array([0.0, 0.0, 25.0]), x0_cov=np.eye(3),
             numba=build_lorenz_fea_numba_dynamics(sigma, rho, beta, dt),
+            torch=build_lorenz_torch_dynamics(sigma, rho, beta, dt),
         )
