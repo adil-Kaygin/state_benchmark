@@ -24,13 +24,7 @@ import numpy as np
 
 from .base import NumbaDynamics
 
-try:
-    from numba import njit
-except ImportError as exc:  # fail fast and loud -- no NumPy fallback
-    raise ImportError(
-        "numba is required to build the level dynamics consumed by the "
-        "classical filters. Install numba (`pip install numba`)."
-    ) from exc
+from numba import njit
 
 
 def build_linear_numba_dynamics(F_mat: np.ndarray, H_mat: np.ndarray) -> NumbaDynamics:
