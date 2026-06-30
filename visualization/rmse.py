@@ -11,6 +11,7 @@ def plot_rmse_comparison_per_dim(
     state_names: Sequence[str],
     title: str = "Per-variable RMSE Comparison",
     output_path: Optional[Path] = None,
+    std_per_dim_by_estimator: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> None:
     """Grouped bar chart of RMSE per named state variable, one bar per estimator.
 
@@ -23,8 +24,14 @@ def plot_rmse_comparison_per_dim(
     Parameters
     ----------
     rmse_per_dim_by_estimator : dict mapping estimator_name -> {state_var: rmse}
-        (each inner dict is the output of metrics.rmse.compute_rmse_per_dim).
+        (each inner dict is the output of metrics.rmse.compute_rmse_per_dim). For
+        a Monte-Carlo sweep, pass the per-variable MEAN here.
     state_names : ordered names of the state variables (the x-axis groups).
+    std_per_dim_by_estimator : optional dict with the same shape giving the
+        per-variable std (or 95% CI half-width) across Monte-Carlo seeds; when
+        supplied, each bar is drawn with a symmetric error bar (the fix for the
+        single-run methodology flaw -- error bars make run-to-run variance
+        visible). Omit it for a single-run chart.
 
     Raises
     ------
@@ -43,6 +50,19 @@ def plot_rmse_comparison_per_dim(
                 f"estimator '{est_name}' is missing RMSE for state variable(s) "
                 f"{missing}; expected one value per name in {state_names}."
             )
+    if std_per_dim_by_estimator is not None:
+        for est_name in estimator_names:
+            if est_name not in std_per_dim_by_estimator:
+                raise ValueError(
+                    f"std_per_dim_by_estimator is missing estimator '{est_name}'; "
+                    "supply a std for every estimator or omit it entirely."
+                )
+            missing = [s for s in state_names if s not in std_per_dim_by_estimator[est_name]]
+            if missing:
+                raise ValueError(
+                    f"std for estimator '{est_name}' is missing state variable(s) "
+                    f"{missing}."
+                )
 
     n_groups = len(state_names)
     n_est = len(estimator_names)
@@ -53,12 +73,18 @@ def plot_rmse_comparison_per_dim(
     for j, est_name in enumerate(estimator_names):
         offsets = x + (j - (n_est - 1) / 2.0) * width
         values = [rmse_per_dim_by_estimator[est_name][s] for s in state_names]
-        bars = ax.bar(offsets, values, width, label=est_name)
-        for bar, val in zip(bars, values):
+        if std_per_dim_by_estimator is not None:
+            errs = [std_per_dim_by_estimator[est_name][s] for s in state_names]
+            bars = ax.bar(offsets, values, width, label=est_name, yerr=errs, capsize=3)
+        else:
+            errs = None
+            bars = ax.bar(offsets, values, width, label=est_name)
+        for k, (bar, val) in enumerate(zip(bars, values)):
+            label = f"{val:.3g}" if errs is None else f"{val:.3g}\n±{errs[k]:.2g}"
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
                 bar.get_height(),
-                f"{val:.3g}",
+                label,
                 ha="center",
                 va="bottom",
                 fontsize=7,

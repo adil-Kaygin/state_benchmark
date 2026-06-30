@@ -1,5 +1,11 @@
-from .config import ExperimentConfig  
-from .result import ExperimentResult  
-from .runner import ExperimentRunner  
-  
-__all__ = ["ExperimentConfig", "ExperimentResult", "ExperimentRunner"]
+from .config import ExperimentConfig
+from .result import ExperimentResult, MonteCarloResult
+from .runner import ExperimentRunner, MonteCarloRunner
+
+__all__ = [
+    "ExperimentConfig",
+    "ExperimentResult",
+    "MonteCarloResult",
+    "ExperimentRunner",
+    "MonteCarloRunner",
+]
