@@ -1,12 +1,27 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 
 from ..base import BaseEstimator
+
+
+def _atomic_torch_save(payload: dict, path: Path) -> None:
+    """torch.save the payload to a temp file in the same directory, then
+    os.replace() it onto the final name. torch.save is not atomic, so a Colab
+    disconnect mid-write could otherwise leave a truncated checkpoint that loads
+    as valid-but-wrong; os.replace is atomic on the same filesystem, so a reader
+    sees either the old file or the fully-written new one, never a partial."""
+    import torch
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
 
 if TYPE_CHECKING:
     import torch
@@ -283,23 +298,42 @@ class SequentialNeuralFilter(BaseEstimator):
         import torch
         if self._network is None:
             raise RuntimeError("No trained network to save.")
+        path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "state_dict": self._network.state_dict(),
             "nx": self._nx,
             "ny": self._ny,
+            "best_val_loss": self._best_val_loss,
             "estimator_name": self.estimator_name,
         }
         payload.update(self._save_hyperparams())
-        torch.save(payload, path)
+        _atomic_torch_save(payload, path)
+
+    def load_weights(self, path: Path) -> bool:
+        """Rebuild the network and load a saved best-weights checkpoint into it on
+        the CPU, marking the estimator as fit() (so estimate() works without a
+        retrain). Returns False only when the file is absent; a present-but-corrupt
+        checkpoint raises (fail-fast -- never silently retrain over a real defect).
+        Pairs with the per-estimator skip/resume loop in the experiment notebook."""
+        import torch
+        path = Path(path)
+        if not path.exists():
+            return False
+        payload = torch.load(path, map_location="cpu")
+        network = self._build_network()
+        network.load_state_dict(payload["state_dict"])
+        self._network = network.to("cpu")
+        self._best_val_loss = float(payload.get("best_val_loss", self._best_val_loss))
+        return True
 
     @classmethod
     def load(cls, path: Path) -> "SequentialNeuralFilter":
         raise NotImplementedError(
             f"{cls.__name__}.load requires a FilterModel. "
             "Reconstruct the estimator from a BenchmarkLevel.get_filter_model() "
-            "with the saved hyperparameters, then torch.load(path) and "
-            "load_state_dict() on its network."
+            "with the saved hyperparameters, then call load_weights(path) on it "
+            "(or torch.load(path) and load_state_dict() on its network)."
         )
 
 

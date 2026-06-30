@@ -8,6 +8,7 @@ from typing import Optional, TYPE_CHECKING
 import numpy as np
 
 from ..base import BaseEstimator
+from ._neural_base import _atomic_torch_save
 
 if TYPE_CHECKING:
     import torch
@@ -758,28 +759,48 @@ class KalmanNetEstimator(BaseEstimator):
         return estimates.numpy()
 
     def save(self, path: Path) -> None:
-        import torch
         if self._network is None:
             raise RuntimeError("No trained network to save.")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
+        _atomic_torch_save(
             {
                 "state_dict": self._network.state_dict(),
                 "nx": self._nx,
                 "ny": self._ny,
                 "hidden_size": self._hidden_size,
                 "predict_log_var": self._predict_log_var,
+                "best_val_loss": self._best_val_loss,
                 "estimator_name": self.estimator_name,
             },
             path,
         )
+
+    def load_weights(self, path: Path) -> bool:
+        """Rebuild the network and load a saved best-weights checkpoint into it on
+        the CPU, marking the estimator as fit() (so estimate() works without a
+        retrain). Returns False only when the file is absent; a present-but-corrupt
+        checkpoint raises (fail-fast). Mirrors SequentialNeuralFilter.load_weights
+        for the per-estimator skip/resume loop in the experiment notebook."""
+        import torch
+        path = Path(path)
+        if not path.exists():
+            return False
+        payload = torch.load(path, map_location="cpu")
+        # _ensure_network builds into self._network; reset first so a re-load on an
+        # already-fit estimator rebuilds rather than reusing stale weights.
+        self._network = None
+        network = self._ensure_network()
+        network.load_state_dict(payload["state_dict"])
+        self._network = network.to("cpu")
+        self._best_val_loss = float(payload.get("best_val_loss", self._best_val_loss))
+        return True
 
     @classmethod
     def load(cls, path: Path) -> "KalmanNetEstimator":
         raise NotImplementedError(
             f"{cls.__name__}.load requires a FilterModel. "
             "Reconstruct the estimator from a BenchmarkLevel.get_filter_model(), "
-            "then call torch.load(path) and load_state_dict() on its network."
+            "then call load_weights(path) on it (or torch.load(path) and "
+            "load_state_dict() on its network)."
         )
 
 
