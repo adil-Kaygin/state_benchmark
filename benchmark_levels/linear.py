@@ -6,7 +6,14 @@ from typing import Optional
   
 import numpy as np  
   
-from .base import BenchmarkLevel, BaseSimulator, FilterModel, NumbaDynamics
+from .base import (
+    BenchmarkLevel,
+    BaseSimulator,
+    FilterModel,
+    NumbaDynamics,
+    split_counts as _split_counts,
+    gaussian_noise as _gaussian_noise,
+)
 from ._numba_dynamics import build_linear_numba_dynamics
 from ._torch_dynamics import build_linear_torch_dynamics
   
@@ -90,26 +97,38 @@ class LinearBenchmark(BenchmarkLevel):
 
         rng = np.random.default_rng(self._random_seed)
         output_dir.mkdir(parents=True, exist_ok=True)
-        simulator = LinearSimulator(self._F, self._H, self._Q, self._R, rng=rng)
-  
-        splits = {  
-            "train": int(self._num_trajectories * 0.7),  
-            "val": int(self._num_trajectories * 0.15),  
-            "test": int(self._num_trajectories * 0.15),  
-        }  
-  
-        for split_name, n_traj in splits.items():  
-            states = np.zeros((n_traj, self._trajectory_length, self.state_dimension))  
-            observations = np.zeros((n_traj, self._trajectory_length, self.observation_dimension))  
-            timestamps = np.arange(self._trajectory_length, dtype=float) * self._dt  
-  
+
+        splits = _split_counts(self._num_trajectories)
+
+        nx = self.state_dimension
+        ny = self.observation_dimension
+        T = self._trajectory_length
+        # Uniform initial conditions over a box matched in variance to the old
+        # Gaussian init (Var[U(-a,a)] = a^2/3 = initial_state_var => a = sqrt(3*var)).
+        # A uniform spread gives the data-driven models a more even coverage of
+        # the state space than a Gaussian clustered at the origin; the linear
+        # dynamics/observation noise (Q, R) stay Gaussian, matching the KF model.
+        init_half = float(np.sqrt(3.0 * self._initial_state_var))
+
+        for split_name, n_traj in splits.items():
+            states = np.zeros((n_traj, T, nx))
+            observations = np.zeros((n_traj, T, ny))
+            timestamps = np.arange(T, dtype=float) * self._dt
+
+            # Draw all noise / initial states up front (one vectorized call each)
+            # instead of one rng.multivariate_normal per timestep -- same draws,
+            # far less Python/RNG overhead.
+            x0 = rng.uniform(-init_half, init_half, size=(n_traj, nx))
+            proc_noise = _gaussian_noise(rng, self._Q, (n_traj, T))
+            obs_noise = _gaussian_noise(rng, self._R, (n_traj, T))
+
             for i in range(n_traj):
-                x = rng.standard_normal(self.state_dimension) * np.sqrt(self._initial_state_var)
-                for t in range(self._trajectory_length):  
-                    states[i, t] = x  
-                    observations[i, t] = simulator.observe(x)  
-                    x = simulator.step(x, None, self._dt)  
-  
+                x = x0[i]
+                for t in range(T):
+                    states[i, t] = x
+                    observations[i, t] = self._H @ x + obs_noise[i, t]
+                    x = self._F @ x + proc_noise[i, t]
+
             metadata = DatasetMetadata(  
                 benchmark_name=self.name,  
                 state_dimension=self.state_dimension,  
@@ -142,6 +161,8 @@ class LinearBenchmark(BenchmarkLevel):
         return FilterModel(
             f=f, h=h, F=F_jac, H=H_jac,
             Q=self._Q.copy(), R=self._R.copy(),
+            # x0_cov = variance of the uniform init box (a^2/3 = initial_state_var),
+            # so the filter's prior matches the data-generating distribution.
             x0_mean=np.zeros(2), x0_cov=np.eye(2) * self._initial_state_var,
             numba=build_linear_numba_dynamics(F_mat, H_mat),
             torch=build_linear_torch_dynamics(F_mat, H_mat),

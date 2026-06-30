@@ -1,29 +1,35 @@
 from __future__ import annotations
 
 """
-Monte-Carlo aggregation across independent dataset realizations (seeds).
+Single-test-set statistics for the benchmark.
 
-A single dataset realization -- however many trajectories it holds -- is a
-high-variance point estimate: the process/observation noise and initial states
-are random, and chaotic levels (Lorenz) amplify minute differences. Comparing
-two estimators on ONE stochastic run is methodologically flawed because the
-delta may fall within the noise margin (see issue Single-Run_Methodology_Flaw).
+Every test trajectory is an independent realization of the system: it has its
+own (uniformly sampled) initial state and its own process/observation noise.
+The RMSE of an estimator on one trajectory is therefore one independent sample,
+and the N trajectories of a single test set give an N-sample estimate of the
+estimator's error distribution.
 
-The fix is to run the full pipeline over N independent base seeds and report the
-mean +/- std (or a 95% CI) of every metric. These helpers do the aggregation;
-`experiments.runner.MonteCarloRunner` drives the seed loop.
+That means we can report a proper mean +/- std and a 95% confidence interval
+from ONE sufficiently large test set -- there is no need to regenerate the whole
+dataset and refit the (expensive) learned models over many random seeds. Using
+e.g. 7500 test trajectories once is both cheaper and statistically cleaner than
+1500 trajectories x 5 seed-realizations: the trajectory count IS the sample size.
+
+These helpers turn the per-trajectory metric arrays
+(metrics.rmse.compute_rmse_per_trajectory_per_dim) into
+{mean, std, ci95, n} summaries.
 """
 
 import math
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Sequence, Tuple
 
 import numpy as np
 
 
 def mean_std(values: Sequence[float]) -> Tuple[float, float]:
     """Mean and (sample) standard deviation of a sequence. std uses ddof=1 when
-    there are >= 2 samples (an unbiased estimate of run-to-run variability); for
-    a single run std is 0.0. Fails fast on an empty sequence."""
+    there are >= 2 samples (an unbiased estimate of variability); for a single
+    sample std is 0.0. Fails fast on an empty sequence."""
     arr = np.asarray(list(values), dtype=np.float64)
     if arr.size == 0:
         raise ValueError("mean_std requires at least one value.")
@@ -34,53 +40,55 @@ def mean_std(values: Sequence[float]) -> Tuple[float, float]:
 
 def ci95_halfwidth(std: float, n: int) -> float:
     """Half-width of a normal-approximation 95% confidence interval for the mean
-    given the sample std and count: 1.96 * std / sqrt(n). 0.0 for n < 2."""
+    given the sample std and count: 1.96 * std / sqrt(n). 0.0 for n < 2.
+
+    With N in the thousands of test trajectories the normal approximation is
+    well justified (CLT); the half-width shrinks as 1/sqrt(N), which is exactly
+    why a single large test set yields a tight, reportable interval.
+    """
     if n < 2:
         return 0.0
     return 1.96 * std / math.sqrt(n)
 
 
-def aggregate_rmse_per_dim(
-    rmse_per_dim_runs: List[Dict[str, float]],
+def summarize_samples(values: Sequence[float]) -> Dict[str, float]:
+    """Summarize a 1-D sample (e.g. per-trajectory RMSE for one state variable)
+    into {"mean", "std", "ci95", "n"}."""
+    arr = np.asarray(list(values), dtype=np.float64)
+    n = int(arr.size)
+    mean, std = mean_std(arr)
+    return {"mean": mean, "std": std, "ci95": ci95_halfwidth(std, n), "n": n}
+
+
+def aggregate_rmse_per_dim_over_trajectories(
+    rmse_per_traj_per_dim: Dict[str, np.ndarray],
 ) -> Dict[str, Dict[str, float]]:
-    """Aggregate per-variable RMSE across runs.
+    """Aggregate per-trajectory RMSE arrays into a mean +/- std / 95% CI per
+    named state variable, over the test trajectories.
 
     Parameters
     ----------
-    rmse_per_dim_runs : list of {state_var: rmse}, one dict per seed/run (each is
-        the output of metrics.rmse.compute_rmse_per_dim).
+    rmse_per_traj_per_dim : {state_var: np.ndarray[N]} -- the output of
+        metrics.rmse.compute_rmse_per_trajectory_per_dim (one RMSE per test
+        trajectory for each named variable).
 
     Returns
     -------
-    {state_var: {"mean": ..., "std": ..., "ci95": ..., "n": ...}}.
+    {state_var: {"mean": ..., "std": ..., "ci95": ..., "n": ...}}, where n is the
+    number of test trajectories.
 
     Raises
     ------
-    ValueError if the run list is empty or the runs do not share the same set of
-        state variables (fail fast: a missing dimension would bias the mean).
+    ValueError if the mapping is empty or any variable's array is empty.
     """
-    if not rmse_per_dim_runs:
-        raise ValueError("aggregate_rmse_per_dim requires at least one run.")
-
-    keys = set(rmse_per_dim_runs[0].keys())
-    for i, run in enumerate(rmse_per_dim_runs):
-        if set(run.keys()) != keys:
-            raise ValueError(
-                f"run {i} has state variables {sorted(run.keys())}, expected "
-                f"{sorted(keys)}; all runs must share the same variables."
-            )
-
-    n = len(rmse_per_dim_runs)
+    if not rmse_per_traj_per_dim:
+        raise ValueError(
+            "aggregate_rmse_per_dim_over_trajectories requires at least one variable."
+        )
     out: Dict[str, Dict[str, float]] = {}
-    for var in rmse_per_dim_runs[0].keys():
-        mean, std = mean_std([run[var] for run in rmse_per_dim_runs])
-        out[var] = {"mean": mean, "std": std, "ci95": ci95_halfwidth(std, n), "n": n}
+    for var, arr in rmse_per_traj_per_dim.items():
+        arr = np.asarray(arr, dtype=np.float64)
+        if arr.size == 0:
+            raise ValueError(f"variable {var!r} has no per-trajectory RMSE samples.")
+        out[var] = summarize_samples(arr)
     return out
-
-
-def aggregate_scalar(values: Sequence[float]) -> Dict[str, float]:
-    """Aggregate a scalar metric (e.g. runtime_per_step_ms / latency) across runs
-    into {"mean", "std", "ci95", "n"}."""
-    n = len(list(values))
-    mean, std = mean_std(values)
-    return {"mean": mean, "std": std, "ci95": ci95_halfwidth(std, n), "n": n}

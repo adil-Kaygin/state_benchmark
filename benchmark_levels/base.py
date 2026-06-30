@@ -8,6 +8,40 @@ from typing import Callable, Optional
 import numpy as np
 
 
+def split_counts(num_trajectories: int) -> dict[str, int]:
+    """70/15/15 train/val/test split that conserves every trajectory.
+
+    The naive ``int(n*0.7) / int(n*0.15) / int(n*0.15)`` silently drops 1-2
+    trajectories when n is not divisible (e.g. n=1500 -> 1050+225+225=1500 ok,
+    but n=2000 -> 1400+300+300=2000 ok; n=1499 -> 1049+224+224=1497, two lost).
+    This assigns the remainder to train so the counts always sum to n exactly.
+    """
+    if num_trajectories <= 0:
+        raise ValueError(f"num_trajectories must be positive; got {num_trajectories}.")
+    n_val = int(num_trajectories * 0.15)
+    n_test = int(num_trajectories * 0.15)
+    n_train = num_trajectories - n_val - n_test
+    return {"train": n_train, "val": n_val, "test": n_test}
+
+
+def gaussian_noise(
+    rng: np.random.Generator, cov: np.ndarray, batch_shape: tuple[int, ...]
+) -> np.ndarray:
+    """Draw zero-mean Gaussian noise of covariance `cov` for a whole batch in one
+    vectorized call. Returns shape (*batch_shape, dim).
+
+    Replaces the per-timestep ``rng.multivariate_normal(...)`` loop in dataset
+    generation: numerically identical draws (same Cholesky-style construction)
+    but one RNG call per split instead of n_traj * T calls. The process and
+    observation noise stay Gaussian on purpose -- that is the model assumption
+    the Kalman-family filters are derived under; only the *initial-condition*
+    sampling is widened to uniform for training robustness.
+    """
+    dim = cov.shape[0]
+    mean = np.zeros(dim)
+    return rng.multivariate_normal(mean, cov, size=batch_shape)
+
+
 @dataclass
 class NumbaDynamics:
     """njit-compiled versions of a FilterModel's dynamics.

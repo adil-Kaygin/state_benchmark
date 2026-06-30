@@ -7,15 +7,12 @@ from pathlib import Path
 
 import numpy as np
 
-from typing import Callable, List, Sequence, Tuple
-
 from .config import ExperimentConfig
-from .result import ExperimentResult, MonteCarloResult
+from .result import ExperimentResult
 from estimators.base import BaseEstimator
 from datasets.schema import TrajectoryDataset
 from metrics.rmse import compute_rmse_per_dim
 from metrics.runtime import runtime_per_step_ms as _runtime_per_step_ms
-from metrics.aggregate import aggregate_rmse_per_dim, aggregate_scalar
 from storage.repository import ExperimentRepository
 
   
@@ -107,73 +104,3 @@ class ExperimentRunner:
 
         return result
 
-
-# A pipeline factory: given a base seed, build everything needed for one
-# independent run -- a FRESH estimator, fresh train/val/test datasets generated
-# at that seed, and the matching config (config.random_seed must equal `seed`).
-# Returns (estimator, train, val, test, config).
-PipelineFactory = Callable[
-    [int],
-    Tuple[BaseEstimator, TrajectoryDataset, TrajectoryDataset, TrajectoryDataset, ExperimentConfig],
-]
-
-
-class MonteCarloRunner:
-    """Drives the full pipeline across N independent dataset realizations and
-    aggregates the metrics into mean +/- std (+ 95% CI), the methodologically
-    sound way to compare estimators on a stochastic / chaotic benchmark
-    (see issue Single-Run_Methodology_Flaw).
-
-    For each base seed it calls `build_pipeline(seed)` to regenerate a fresh
-    dataset (train/val/test), a fresh estimator, and a config whose random_seed
-    is that seed, then runs the existing single-run `ExperimentRunner.run`. Each
-    seed is persisted as its own experiment row (unique experiment_id, its own
-    random_seed) by the underlying runner, so the SQLite store already tracks the
-    seed per run -- this class only adds the seed loop and the aggregation.
-    """
-
-    def __init__(self, runner: ExperimentRunner) -> None:
-        self._runner = runner
-
-    def run(
-        self,
-        seeds: Sequence[int],
-        build_pipeline: PipelineFactory,
-        verbose: bool = True,
-    ) -> MonteCarloResult:
-        seeds = list(seeds)
-        if not seeds:
-            raise ValueError("MonteCarloRunner.run requires a non-empty list of seeds.")
-
-        per_seed: List[ExperimentResult] = []
-        benchmark_name = None
-        estimator_name = None
-        for seed in seeds:
-            estimator, train_ds, val_ds, test_ds, config = build_pipeline(seed)
-            if config.random_seed != seed:
-                raise ValueError(
-                    f"build_pipeline returned config.random_seed={config.random_seed} "
-                    f"for requested seed {seed}; they must match so each run is "
-                    "tagged with its own dataset seed."
-                )
-            if verbose:
-                print(
-                    f"[montecarlo] {config.benchmark_name}/{config.estimator_name} "
-                    f"seed={seed} ({len(per_seed) + 1}/{len(seeds)})"
-                )
-            result = self._runner.run(estimator, train_ds, val_ds, test_ds, config)
-            per_seed.append(result)
-            benchmark_name = config.benchmark_name
-            estimator_name = config.estimator_name
-
-        rmse_agg = aggregate_rmse_per_dim([r.rmse_per_dim for r in per_seed])
-        runtime_agg = aggregate_scalar([r.runtime_per_step_ms for r in per_seed])
-
-        return MonteCarloResult(
-            benchmark_name=benchmark_name,
-            estimator_name=estimator_name,
-            seeds=seeds,
-            rmse_per_dim=rmse_agg,
-            runtime_per_step_ms=runtime_agg,
-            per_seed_results=per_seed,
-        )

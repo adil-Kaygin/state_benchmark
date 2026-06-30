@@ -6,7 +6,13 @@ from typing import Optional
 
 import numpy as np
 
-from .base import BenchmarkLevel, BaseSimulator, FilterModel
+from .base import (
+    BenchmarkLevel,
+    BaseSimulator,
+    FilterModel,
+    split_counts as _split_counts,
+    gaussian_noise as _gaussian_noise,
+)
 from ._numba_dynamics import (
     build_lorenz_numba_dynamics,
     build_lorenz_fea_numba_dynamics,
@@ -21,6 +27,15 @@ from ._torch_dynamics import build_lorenz_torch_dynamics
 # finite without distorting behaviour near the attractor. The data-generating
 # simulator is never clipped -- ground truth is untouched.
 _STATE_BOUND = 1.0e3
+
+# Uniform initial-condition box for data generation: centered near the attractor
+# and wide enough to give the data-driven models even coverage of the start
+# region, instead of a Gaussian blob at a single point. (cx, cy, cz) is the
+# center, (hx, hy, hz) the half-widths => init ~ U(center +/- half_width).
+# The filter's x0_cov is set to the matching per-axis variance (half^2 / 3).
+_INIT_CENTER = np.array([0.0, 0.0, 25.0])
+_INIT_HALFWIDTH = np.array([8.0, 8.0, 8.0])
+_INIT_VAR = (_INIT_HALFWIDTH ** 2) / 3.0
 
 
 def _lorenz_deriv(state: np.ndarray, sigma: float, rho: float, beta: float) -> np.ndarray:
@@ -133,27 +148,41 @@ class _BaseLorenzBenchmark(BenchmarkLevel):
 
         rng = np.random.default_rng(self._random_seed)
         output_dir.mkdir(parents=True, exist_ok=True)
-        simulator = LorenzSimulator(
-            self._sigma, self._rho, self._beta, self._Q, self._R, rng=rng
-        )
 
-        splits = {
-            "train": int(self._num_trajectories * 0.7),
-            "val": int(self._num_trajectories * 0.15),
-            "test": int(self._num_trajectories * 0.15),
-        }
+        splits = _split_counts(self._num_trajectories)
+
+        nx = self.state_dimension
+        ny = self.observation_dimension
+        T = self._trajectory_length
+        sigma, rho, beta, dt = self._sigma, self._rho, self._beta, self._dt
 
         for split_name, n_traj in splits.items():
-            states = np.zeros((n_traj, self._trajectory_length, self.state_dimension))
-            observations = np.zeros((n_traj, self._trajectory_length, self.observation_dimension))
-            timestamps = np.arange(self._trajectory_length, dtype=float) * self._dt
+            states = np.zeros((n_traj, T, nx))
+            observations = np.zeros((n_traj, T, ny))
+            timestamps = np.arange(T, dtype=float) * dt
+
+            # Uniform initial conditions over a box around the attractor (even
+            # coverage for the data-driven models) and vectorized Gaussian Q/R
+            # noise. The chaotic RK4 step itself is an inherently sequential
+            # recurrence and stays in the per-timestep loop.
+            x0 = rng.uniform(
+                _INIT_CENTER - _INIT_HALFWIDTH,
+                _INIT_CENTER + _INIT_HALFWIDTH,
+                size=(n_traj, nx),
+            )
+            proc_noise = _gaussian_noise(rng, self._Q, (n_traj, T))
+            obs_noise = _gaussian_noise(rng, self._R, (n_traj, T))
 
             for i in range(n_traj):
-                x = rng.standard_normal(3) + np.array([0.0, 0.0, 25.0])
-                for t in range(self._trajectory_length):
+                x = x0[i]
+                for t in range(T):
                     states[i, t] = x
-                    observations[i, t] = simulator.observe(x)
-                    x = simulator.step(x, None, self._dt)
+                    observations[i, t] = np.array([x[0], x[1]]) + obs_noise[i, t]
+                    k1 = _lorenz_deriv(x, sigma, rho, beta)
+                    k2 = _lorenz_deriv(x + 0.5 * dt * k1, sigma, rho, beta)
+                    k3 = _lorenz_deriv(x + 0.5 * dt * k2, sigma, rho, beta)
+                    k4 = _lorenz_deriv(x + dt * k3, sigma, rho, beta)
+                    x = x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4) + proc_noise[i, t]
 
             metadata = DatasetMetadata(
                 benchmark_name=self.name,
@@ -247,7 +276,7 @@ class LorenzBenchmark(_BaseLorenzBenchmark):
         return FilterModel(
             f=f, h=h, F=F_jac, H=H_jac,
             Q=self._Q.copy(), R=self._R.copy(),
-            x0_mean=np.array([0.0, 0.0, 25.0]), x0_cov=np.eye(3),
+            x0_mean=_INIT_CENTER.copy(), x0_cov=np.diag(_INIT_VAR),
             numba=build_lorenz_numba_dynamics(sigma, rho, beta, dt),
             torch=build_lorenz_torch_dynamics(sigma, rho, beta, dt),
         )
@@ -291,7 +320,7 @@ class LorenzFEABenchmark(_BaseLorenzBenchmark):
         return FilterModel(
             f=f, h=h, F=F_jac, H=H_jac,
             Q=self._Q.copy(), R=self._R.copy(),
-            x0_mean=np.array([0.0, 0.0, 25.0]), x0_cov=np.eye(3),
+            x0_mean=_INIT_CENTER.copy(), x0_cov=np.diag(_INIT_VAR),
             numba=build_lorenz_fea_numba_dynamics(sigma, rho, beta, dt),
             torch=build_lorenz_torch_dynamics(sigma, rho, beta, dt),
         )

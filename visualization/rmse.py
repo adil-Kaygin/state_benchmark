@@ -24,14 +24,14 @@ def plot_rmse_comparison_per_dim(
     Parameters
     ----------
     rmse_per_dim_by_estimator : dict mapping estimator_name -> {state_var: rmse}
-        (each inner dict is the output of metrics.rmse.compute_rmse_per_dim). For
-        a Monte-Carlo sweep, pass the per-variable MEAN here.
+        (each inner dict is the output of metrics.rmse.compute_rmse_per_dim).
+        Pass the per-variable MEAN over the test trajectories here (the "mean"
+        field of metrics.aggregate.aggregate_rmse_per_dim_over_trajectories).
     state_names : ordered names of the state variables (the x-axis groups).
     std_per_dim_by_estimator : optional dict with the same shape giving the
-        per-variable std (or 95% CI half-width) across Monte-Carlo seeds; when
-        supplied, each bar is drawn with a symmetric error bar (the fix for the
-        single-run methodology flaw -- error bars make run-to-run variance
-        visible). Omit it for a single-run chart.
+        per-variable std (or 95% CI half-width) over the test trajectories; when
+        supplied, each bar is drawn with a symmetric error bar so the spread of
+        per-trajectory error is visible. Omit it for a bare-mean chart.
 
     Raises
     ------

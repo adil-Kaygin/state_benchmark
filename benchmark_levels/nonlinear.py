@@ -6,7 +6,13 @@ from typing import Optional
   
 import numpy as np  
   
-from .base import BenchmarkLevel, BaseSimulator, FilterModel
+from .base import (
+    BenchmarkLevel,
+    BaseSimulator,
+    FilterModel,
+    split_counts as _split_counts,
+    gaussian_noise as _gaussian_noise,
+)
 from ._numba_dynamics import build_nonlinear_numba_dynamics
 from ._torch_dynamics import build_nonlinear_torch_dynamics
   
@@ -81,26 +87,36 @@ class NonlinearBenchmark(BenchmarkLevel):
 
         rng = np.random.default_rng(self._random_seed)
         output_dir.mkdir(parents=True, exist_ok=True)
-        simulator = NonlinearSimulator(self._Q, self._R, rng=rng)
-  
-        splits = {  
-            "train": int(self._num_trajectories * 0.7),  
-            "val": int(self._num_trajectories * 0.15),  
-            "test": int(self._num_trajectories * 0.15),  
-        }  
-  
-        for split_name, n_traj in splits.items():  
-            states = np.zeros((n_traj, self._trajectory_length, self.state_dimension))  
-            observations = np.zeros((n_traj, self._trajectory_length, self.observation_dimension))  
-            timestamps = np.arange(self._trajectory_length, dtype=float)  
-  
-            for i in range(n_traj):  
-                x = rng.standard_normal(self.state_dimension)  
-                for t in range(self._trajectory_length):  
-                    states[i, t] = x  
-                    observations[i, t] = simulator.observe(x)  
-                    x = simulator.step(x, None, float(t))  
-  
+
+        splits = _split_counts(self._num_trajectories)
+
+        nx = self.state_dimension
+        ny = self.observation_dimension
+        T = self._trajectory_length
+        # Uniform init matched in variance to the old standard-normal init
+        # (Var[U(-a,a)] = a^2/3 = 1 => a = sqrt(3)); x0_cov stays eye(1) so the
+        # filter prior still matches. Wider, more even coverage of the state for
+        # the data-driven models; Q/R noise stays Gaussian (the model assumption).
+        init_half = float(np.sqrt(3.0))
+
+        for split_name, n_traj in splits.items():
+            states = np.zeros((n_traj, T, nx))
+            observations = np.zeros((n_traj, T, ny))
+            timestamps = np.arange(T, dtype=float)
+
+            x0 = rng.uniform(-init_half, init_half, size=(n_traj, nx))
+            proc_noise = _gaussian_noise(rng, self._Q, (n_traj, T))
+            obs_noise = _gaussian_noise(rng, self._R, (n_traj, T))
+
+            for i in range(n_traj):
+                x = x0[i]
+                for t in range(T):
+                    states[i, t] = x
+                    observations[i, t] = np.array([x[0] ** 2 / 20.0]) + obs_noise[i, t]
+                    xv = x[0]
+                    new_x = 0.5 * xv + 25.0 * xv / (1.0 + xv ** 2) + 8.0 * np.cos(1.2 * float(t))
+                    x = np.array([new_x]) + proc_noise[i, t]
+
             metadata = DatasetMetadata(  
                 benchmark_name=self.name,  
                 state_dimension=self.state_dimension,  

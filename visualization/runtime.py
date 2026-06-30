@@ -13,10 +13,9 @@ def plot_runtime_comparison(
 ) -> None:
     """Bar chart of per-step runtime, one bar per estimator.
 
-    runtime_values is the per-estimator runtime (the MEAN across Monte-Carlo
-    seeds when aggregating). runtime_errors, if supplied, gives the matching std
-    (or 95% CI half-width) across seeds and draws symmetric error bars -- the
-    fix for the single-run methodology flaw applied to the latency metric.
+    runtime_values is the per-estimator latency (a single mean ms/step value).
+    runtime_errors, if supplied, gives a matching spread (e.g. std / 95% CI
+    half-width) and draws symmetric error bars.
     """
     import matplotlib.pyplot as plt
 
