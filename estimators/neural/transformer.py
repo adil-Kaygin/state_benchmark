@@ -168,9 +168,39 @@ class TransformerEstimator(SequentialNeuralFilter):
             "residual_head": self._residual_head,
         }
 
+    # --- Issue 9: precompute the weight-independent teacher-forced features ---
+
+    def _wants_feats_cache(self) -> bool:
+        # Only innovation mode has a teacher-forced (state-dependent) feature to
+        # cache; the raw-[y,dt] branch does not.
+        return self._use_innovation_features
+
+    def _precompute_feats(self, observations, states, timestamps, device):
+        """Build the full per-step input `feats` [N, T, 2*ny+nx+1] ONCE per fit
+        (Issue 9). Only meaningful in innovation mode -- the raw-[y,dt] branch has
+        no teacher-forced (state-dependent) part, so return None there and let
+        _forward_train build its trivial zero-x_pred features per batch. The
+        teacher-forced x_pred/y_pred come from the shared helper; the result is a
+        pure function of (states, timestamps, model) and is numerically identical
+        to rebuilding it every epoch."""
+        if not self._use_innovation_features:
+            return None
+        import torch
+        from ._neural_base import precompute_teacher_forced
+        self._require_torch_dynamics()
+        torch_f = self._model.torch.f
+        torch_h = self._model.torch.h
+        N, T, _ = observations.shape
+        dt = torch.as_tensor(dt_array(timestamps), dtype=observations.dtype, device=device)
+        dt_col = dt.view(1, T, 1).expand(N, T, 1)
+        x_pred, y_pred = precompute_teacher_forced(torch_f, torch_h, states, timestamps)
+        innovation = observations - y_pred
+        return torch.cat([observations, innovation, x_pred, dt_col], dim=-1)
+
     # --- GPU parallel forward (single masked pass over T) ----------------
 
-    def _forward_train(self, network, observations, states, timestamps, device):
+    def _forward_train(self, network, observations, states, timestamps, device,
+                       feats_cache=None):
         import torch
 
         B, T, _ = observations.shape
@@ -182,10 +212,19 @@ class TransformerEstimator(SequentialNeuralFilter):
             x_pred = torch.zeros(B, T, self._nx, device=device, dtype=observations.dtype)
             return network(feats, x_pred)
 
+        if feats_cache is not None:
+            # Issue 9: reuse the per-fit teacher-forced features; recover x_pred
+            # from its known slice [y(ny), innovation(ny), x_pred(nx), dt(1)] so
+            # the residual head sees the SAME x_pred as the uncached path.
+            feats = feats_cache
+            x_pred = feats[..., 2 * self._ny: 2 * self._ny + self._nx]
+            return network(feats, x_pred)
+
         # Innovation features: x_prev_{t} = ground-truth state at t-1 (zeros at
         # t=0) -- the parallel teacher-forced INPUT construction. x_pred = f(x_prev),
         # innovation = y - h(x_pred). All built up front from GT, so the masked
-        # forward stays a single parallel pass over T.
+        # forward stays a single parallel pass over T. (Fallback path when fit()
+        # did not precompute a cache, e.g. a direct _forward_train call.)
         self._require_torch_dynamics()
         torch_f = self._model.torch.f
         torch_h = self._model.torch.h

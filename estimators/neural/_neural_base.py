@@ -28,6 +28,35 @@ if TYPE_CHECKING:
     from datasets.schema import TrajectoryDataset
 
 
+def precompute_teacher_forced(torch_f, torch_h, states, timestamps):
+    """Build the weight-INDEPENDENT teacher-forced predictions for a whole batch
+    of trajectories in one shot (Issue 9).
+
+      x_prev[:, t] = states[:, t-1]   (zeros at t=0)      # GT shifted right
+      x_pred[:, t] = f(x_prev[:, t], t)
+      y_pred[:, t] = h(x_pred[:, t], t)
+
+    Returns (x_pred [B,T,nx], y_pred [B,T,ny]) on states.device.
+
+    This is a pure function of (states, timestamps, filter_model) -- none of
+    which change during a fit() -- so its result can be computed ONCE and reused
+    across every epoch/batch instead of being rebuilt each time. Caching it is
+    numerically IDENTICAL to recomputing (same bits, no gradients flow through it:
+    the inputs are ground-truth constants), it only removes redundant work.
+
+    f/h take a SCALAR t per step (the nonlinear level's f uses cos(1.2*t)), so t
+    cannot be folded into one [B*T] call in general -- the per-step stack stays.
+    The point is to run this loop ONCE per fit, not once per epoch."""
+    import torch
+    B, T, nx = states.shape
+    x_prev = torch.zeros_like(states)
+    x_prev[:, 1:, :] = states[:, :-1, :]
+    ts = timestamps.tolist()
+    x_pred = torch.stack([torch_f(x_prev[:, t, :], ts[t]) for t in range(T)], dim=1)
+    y_pred = torch.stack([torch_h(x_pred[:, t, :], ts[t]) for t in range(T)], dim=1)
+    return x_pred, y_pred
+
+
 class SequentialNeuralFilter(BaseEstimator):
     """
     Shared scaffolding for the GPU-train / CPU-infer neural filters
@@ -94,6 +123,9 @@ class SequentialNeuralFilter(BaseEstimator):
         self.history_ = {"train_loss": [], "val_loss": [], "lr": [], "epoch": []}
         self.best_epoch_ = None
         self.stopped_epoch_ = None
+        # Set by fit() (Issue 9): True when the subclass precomputed a per-fit
+        # teacher-forced feature cache carried through the DataLoader.
+        self._has_feats_cache = False
 
     # --- interface a subclass must satisfy -------------------------------
 
@@ -112,17 +144,60 @@ class SequentialNeuralFilter(BaseEstimator):
     def _build_network(self):
         raise NotImplementedError
 
-    def _forward_train(self, network, observations, states, timestamps, device):
+    def _forward_train(self, network, observations, states, timestamps, device,
+                       feats_cache=None):
         """Batched, parallel forward over the whole [B, T, *] sequence on GPU,
-        returning x_hat [B, T, nx]. Used by the default `_loss`."""
+        returning x_hat [B, T, nx]. Used by the default `_loss`.
+
+        `feats_cache` (Issue 9): an optional per-batch tensor of precomputed,
+        weight-independent input features; subclasses that precompute use it to
+        skip rebuilding the teacher-forced input every epoch. None => build as
+        before (unchanged behavior)."""
         raise NotImplementedError
 
-    def _loss(self, network, observations, states, timestamps, device):
+    def _loss(self, network, observations, states, timestamps, device, feats_cache=None):
         """Default training loss: MSE of the batched forward vs ground truth.
-        Override (e.g. PINN) to add physics residual terms."""
+        Override (e.g. PINN) to add physics residual terms.
+
+        `feats_cache` (added by fit() when a subclass precomputes one) is an
+        optional per-batch tensor carrying the weight-independent teacher-forced
+        input features (Issue 9); the default forward ignores it, subclasses that
+        precompute (Transformer/Mamba) read it in `_forward_train`."""
         import torch.nn.functional as F
-        pred = self._forward_train(network, observations, states, timestamps, device)
+        pred = self._forward_train(
+            network, observations, states, timestamps, device, feats_cache=feats_cache
+        )
         return F.mse_loss(pred, states)
+
+    def _unpack_batch(self, batch, device):
+        """Move a DataLoader batch to `device`. Handles both the plain
+        (obs, states) batch and the (obs, states, feats_cache) batch produced when
+        a subclass precomputes features (Issue 9). Returns (obs, states, feats or
+        None)."""
+        if len(batch) == 3:
+            obs_b, states_b, feats_b = batch
+            return obs_b.to(device), states_b.to(device), feats_b.to(device)
+        obs_b, states_b = batch
+        return obs_b.to(device), states_b.to(device), None
+
+    def _wants_feats_cache(self) -> bool:
+        """Whether `_precompute_feats` would return a cache for this fit (Issue 9).
+        Lets fit() skip the whole-dataset device copy that `_precompute_feats`
+        needs when there is nothing to cache. Default False; caching subclasses
+        (Transformer/Mamba in innovation mode) override to their gating flag."""
+        return False
+
+    def _precompute_feats(self, observations, states, timestamps, device):
+        """Optional hook (Issue 9): return an [N, T, F] tensor of weight-
+        independent per-step input features to cache once per fit and slice per
+        batch, or None (default) to disable caching. When non-None, fit() puts it
+        in the TensorDataset alongside (obs, states) so the DataLoader shuffle
+        permutes it in lockstep, and passes each batch's slice to `_loss` /
+        `_forward_train` via `feats_cache`. Subclasses whose forward builds a
+        weight-independent teacher-forced feature (Transformer, Mamba in
+        innovation mode) override this; everyone else leaves it None. Only called
+        when `_wants_feats_cache()` is True."""
+        return None
 
     def _estimate_sequential_cpu(self, network, observations, timestamps):
         """Strictly sequential CPU inference: one trajectory / one timestep at a
@@ -143,6 +218,16 @@ class SequentialNeuralFilter(BaseEstimator):
             )
 
     def _training_device(self):
+        """Resolve the training device. An explicit `device` kwarg is honored
+        exactly; otherwise auto (cuda if present, else cpu).
+
+        Issue 12 note: PINN and Neural-ODE are single-phase filters whose forward
+        is an irreducible sequential T-loop (each step uses the net's own previous
+        output). On small/narrow levels that loop is launch-bound and a CPU can be
+        FASTER than a GPU (no per-step kernel-launch overhead). If a level trains
+        slowly on GPU, pass `device="cpu"` for that (level, estimator) in the
+        notebook config -- no code change needed, it flows straight through here.
+        (KalmanNet expresses the same idea per-phase via `phase2_device`.)"""
         import torch
         if self._device_name is not None:
             return torch.device(self._device_name)
@@ -187,12 +272,35 @@ class SequentialNeuralFilter(BaseEstimator):
         train_ts = torch.as_tensor(np.asarray(train_dataset.timestamps), dtype=torch.float32)
         val_ts = torch.as_tensor(np.asarray(val_dataset.timestamps), dtype=torch.float32)
 
-        train_loader = DataLoader(
-            TensorDataset(train_obs, train_states), batch_size=self._batch_size, shuffle=True,
-        )
-        val_loader = DataLoader(
-            TensorDataset(val_obs, val_states), batch_size=self._batch_size, shuffle=False,
-        )
+        # Issue 9: if the subclass precomputes a weight-independent teacher-forced
+        # feature, build it ONCE per split here (on `device`, where the RK4 f/h
+        # cost actually lives) instead of every epoch inside _forward_train. Store
+        # it as a THIRD tensor in the TensorDataset so the DataLoader's shuffle
+        # permutes it in lockstep with (obs, states) -- the cache can never desync
+        # from its sample. Kept on CPU in the dataset and moved per batch, exactly
+        # like obs/states; the expensive part (the f/h loop) already ran once on
+        # the GPU. Non-caching estimators skip the whole-dataset device copy
+        # entirely (behavior identical to before).
+        if self._wants_feats_cache():
+            train_feats = self._precompute_feats(
+                train_obs.to(device), train_states.to(device), train_ts, device
+            )
+            val_feats = self._precompute_feats(
+                val_obs.to(device), val_states.to(device), val_ts, device
+            )
+        else:
+            train_feats = val_feats = None
+        self._has_feats_cache = train_feats is not None
+
+        if self._has_feats_cache:
+            train_ds = TensorDataset(train_obs, train_states, train_feats.cpu())
+            val_ds = TensorDataset(val_obs, val_states, val_feats.cpu())
+        else:
+            train_ds = TensorDataset(train_obs, train_states)
+            val_ds = TensorDataset(val_obs, val_states)
+
+        train_loader = DataLoader(train_ds, batch_size=self._batch_size, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=self._batch_size, shuffle=False)
 
         optimizer = torch.optim.Adam(
             network.parameters(), lr=self._lr, weight_decay=self._weight_decay
@@ -211,10 +319,9 @@ class SequentialNeuralFilter(BaseEstimator):
 
             network.train()
             train_loss_total, train_batches = 0.0, 0
-            for obs_b, states_b in train_loader:
-                obs_b = obs_b.to(device)
-                states_b = states_b.to(device)
-                loss = self._loss(network, obs_b, states_b, train_ts, device)
+            for batch in train_loader:
+                obs_b, states_b, feats_b = self._unpack_batch(batch, device)
+                loss = self._loss(network, obs_b, states_b, train_ts, device, feats_cache=feats_b)
                 # Skip update if loss is NaN/Inf to prevent weight corruption.
                 if not math.isfinite(loss.item()):
                     optimizer.zero_grad()
@@ -230,10 +337,11 @@ class SequentialNeuralFilter(BaseEstimator):
             network.eval()
             val_loss_total, val_batches = 0.0, 0
             with torch.no_grad():
-                for obs_b, states_b in val_loader:
-                    obs_b = obs_b.to(device)
-                    states_b = states_b.to(device)
-                    val_loss_total += self._loss(network, obs_b, states_b, val_ts, device).item()
+                for batch in val_loader:
+                    obs_b, states_b, feats_b = self._unpack_batch(batch, device)
+                    val_loss_total += self._loss(
+                        network, obs_b, states_b, val_ts, device, feats_cache=feats_b
+                    ).item()
                     val_batches += 1
             val_loss = val_loss_total / max(val_batches, 1)
 

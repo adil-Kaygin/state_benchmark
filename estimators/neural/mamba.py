@@ -299,9 +299,35 @@ class MambaEstimator(SequentialNeuralFilter):
             "use_mamba_ssm_kernels": self._use_mamba_ssm_kernels,
         }
 
+    # --- Issue 9: precompute the weight-independent teacher-forced features ---
+
+    def _wants_feats_cache(self) -> bool:
+        # Only innovation mode has a teacher-forced feature to cache.
+        return self._use_innovation_features
+
+    def _precompute_feats(self, observations, states, timestamps, device):
+        """Build the full per-step input `feats` [N, T, 2*ny+nx+1] ONCE per fit
+        (Issue 9), identical to the Transformer's cache. Only in innovation mode;
+        the raw-[y,dt] branch has no teacher-forced part -> None. Numerically
+        identical to rebuilding the features each epoch."""
+        if not self._use_innovation_features:
+            return None
+        import torch
+        from ._neural_base import precompute_teacher_forced
+        self._require_torch_dynamics()
+        torch_f = self._model.torch.f
+        torch_h = self._model.torch.h
+        N, T, _ = observations.shape
+        dt = torch.as_tensor(dt_array(timestamps), dtype=observations.dtype, device=device)
+        dt_col = dt.view(1, T, 1).expand(N, T, 1)
+        x_pred, y_pred = precompute_teacher_forced(torch_f, torch_h, states, timestamps)
+        innovation = observations - y_pred
+        return torch.cat([observations, innovation, x_pred, dt_col], dim=-1)
+
     # --- GPU parallel-scan forward --------------------------------------
 
-    def _forward_train(self, network, observations, states, timestamps, device):
+    def _forward_train(self, network, observations, states, timestamps, device,
+                       feats_cache=None):
         import torch
 
         B, T, _ = observations.shape
@@ -313,8 +339,16 @@ class MambaEstimator(SequentialNeuralFilter):
             x_pred = torch.zeros(B, T, self._nx, device=device, dtype=observations.dtype)
             return network(feats, x_pred)
 
+        if feats_cache is not None:
+            # Issue 9: reuse the per-fit teacher-forced features; recover x_pred
+            # from its slice [y(ny), innovation(ny), x_pred(nx), dt(1)].
+            feats = feats_cache
+            x_pred = feats[..., 2 * self._ny: 2 * self._ny + self._nx]
+            return network(feats, x_pred)
+
         # Innovation features from GROUND-TRUTH previous state (parallel
         # teacher-forced input), so the scan stays a single parallel pass over T.
+        # (Fallback when fit() did not precompute a cache.)
         self._require_torch_dynamics()
         torch_f = self._model.torch.f
         torch_h = self._model.torch.h
