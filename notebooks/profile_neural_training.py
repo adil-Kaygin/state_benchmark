@@ -214,25 +214,75 @@ for name, est in make_estimators(prof_device).items():
 
 
 # %% [markdown]
-# ## Cell 4 -- KalmanNet Phase-1 vs Phase-2 time
+# ## Cell 4 -- KalmanNet Phase-1 vs Phase-2 s/epoch
 #
-# history_["phase"] tags each epoch 1 (teacher-forced, parallel + now cached) or
-# 2 (free-running, sequential). Split the per-epoch wall-clock by phase.
+# The one number this cell exists to produce: **P1 s/epoch vs P2 s/epoch**, the
+# split that motivates running Phase 2 on CPU (Issue 12). Phase 1 is teacher-
+# forced, fully parallel over T, and its weight-independent prefix is cached
+# (Issue 9); Phase 2 is free-running and sequential. history_["phase"] already
+# tags each epoch 1 or 2, but carries no timing -- so we wrap the two per-epoch
+# entry points (`_run_epoch_phase1_cached`, `_run_epoch`) in a wall-clock timer
+# to attribute time to the phase, changing NO estimator code (measurement only,
+# the notebook's contract).
+#
+# Epoch bookkeeping (avoids the off-by-one the old cell hid): with
+# curriculum_epochs = max(PROF_EPOCHS//2, 1), the curriculum runs that many
+# Phase-1 epochs **plus** num_epochs=PROF_EPOCHS Phase-2 epochs -- the two are
+# independent budgets, so total epochs = curriculum_epochs + num_epochs, NOT
+# PROF_EPOCHS. We report s/epoch per phase, which is invariant to those counts.
 
 # %%
+_curriculum = max(PROF_EPOCHS // 2, 1)
 kn = KalmanNetEstimator(
     filter_model, hidden_size=64, random_seed=RANDOM_SEED,
-    num_epochs=PROF_EPOCHS, curriculum_epochs=max(PROF_EPOCHS // 2, 1),
+    num_epochs=PROF_EPOCHS, curriculum_epochs=_curriculum,
     batch_size=PROF_BATCH, device=DEVICES[0], phase2_device=None, verbose=True,
 )
-with timed("KalmanNet fit (curriculum)", DEVICES[0]):
-    kn.fit(train_ds, val_ds)
-phases = kn.history_["phase"]
-n_p1 = sum(1 for p in phases if p == 1)
-n_p2 = sum(1 for p in phases if p == 2)
-print(f"Phase-1 epochs (GPU parallel, cached prefix): {n_p1}")
-print(f"Phase-2 epochs (CPU free-running by default):  {n_p2}")
-print("Note: with phase2_device=None Phase 2 runs on CPU (Issue 12).")
+
+# Time each epoch by phase without touching estimator code: wrap the two
+# per-epoch methods so each records its wall-clock into a per-phase list. Phase 1
+# runs on the training device (DEVICES[0]); Phase 2 runs on phase2_device (CPU by
+# default), so sync against the right device around each timer.
+_phase_secs = {1: [], 2: []}
+_p2_dev = kn._phase2_device()
+_orig_p1 = kn._run_epoch_phase1_cached
+_orig_p2 = kn._run_epoch
+
+
+def _timed_p1(*a, **k):
+    _sync(DEVICES[0]); t0 = time.perf_counter()
+    out = _orig_p1(*a, **k)
+    _sync(DEVICES[0]); _phase_secs[1].append(time.perf_counter() - t0)
+    return out
+
+
+def _timed_p2(*a, **k):
+    _sync(_p2_dev); t0 = time.perf_counter()
+    out = _orig_p2(*a, **k)
+    _sync(_p2_dev); _phase_secs[2].append(time.perf_counter() - t0)
+    return out
+
+
+kn._run_epoch_phase1_cached = _timed_p1
+kn._run_epoch = _timed_p2
+try:
+    with timed("KalmanNet fit (curriculum)", DEVICES[0]):
+        kn.fit(train_ds, val_ds)
+finally:
+    kn._run_epoch_phase1_cached = _orig_p1
+    kn._run_epoch = _orig_p2
+
+n_p1, n_p2 = len(_phase_secs[1]), len(_phase_secs[2])
+p1_total, p2_total = sum(_phase_secs[1]), sum(_phase_secs[2])
+p1_per = p1_total / max(n_p1, 1)
+p2_per = p2_total / max(n_p2, 1)
+print(f"\nphase                                  epochs   total_s   s/epoch")
+print(f"Phase 1 (teacher-forced, {DEVICES[0]:<4} cached) {n_p1:>6}  {p1_total:8.3f}  {p1_per:8.3f}")
+print(f"Phase 2 (free-running, {str(_p2_dev.type):<4})        {n_p2:>6}  {p2_total:8.3f}  {p2_per:8.3f}")
+if p2_per > 0 and p1_per > 0:
+    print(f"\nPhase 2 is {p2_per / p1_per:.1f}x the per-epoch cost of Phase 1 "
+          f"-- the sequential free-running loop, which is why it runs on CPU "
+          f"(phase2_device=None => {_p2_dev.type}, Issue 12).")
 
 
 # %% [markdown]
