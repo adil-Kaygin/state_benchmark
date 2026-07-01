@@ -166,6 +166,7 @@ class KalmanNetEstimator(BaseEstimator):
         curriculum_epochs: int = 0,
         batch_size: int = 32,
         device: Optional[str] = None,
+        phase2_device: Optional[str] = None,
         random_seed: int = 0,
         grad_clip_norm: float = 0.5,
         weight_decay: float = 0.0,
@@ -190,6 +191,14 @@ class KalmanNetEstimator(BaseEstimator):
         self._curriculum_epochs = curriculum_epochs
         self._batch_size = batch_size
         self._device_name = device
+        # Issue 12: the free-running Phase-2 recurrence is a launch-bound
+        # sequential T-loop that a CPU usually runs faster than a GPU (no per-step
+        # kernel-launch overhead, tensors stay in cache) -- and it matches the
+        # CPU-only deployment path. Phase 1 (one big parallel [B,T,*] matmul) still
+        # wants `device` (auto -> cuda). phase2_device=None defaults Phase 2 to CPU;
+        # an explicit value is honored exactly (escape hatch for large-batch GPU
+        # Phase 2). No silent override of an explicit `device`.
+        self._phase2_device_name = phase2_device
         self._random_seed = random_seed
         self._grad_clip_norm = grad_clip_norm
         self._weight_decay = weight_decay
@@ -264,6 +273,15 @@ class KalmanNetEstimator(BaseEstimator):
             return torch.device(self._device_name)
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    def _phase2_device(self):
+        """Device for the free-running Phase-2 recurrence (Issue 12). Explicit
+        phase2_device honored; None defaults to CPU (the usual win for a
+        launch-bound sequential T-loop)."""
+        import torch
+        if self._phase2_device_name is not None:
+            return torch.device(self._phase2_device_name)
+        return torch.device("cpu")
+
     def _ensure_network(self):
         if self._network is None:
             self._network = _KalmanGainGRU.build(
@@ -311,11 +329,15 @@ class KalmanNetEstimator(BaseEstimator):
         # The free-running path runs network.step EAGER on purpose: it is the
         # sequential bottleneck and torch.compile is a net loss here (per-step
         # launch overhead dominates and the train/val grad-mode flip thrashes the
-        # recompile guard). Compile is reserved for the Phase-1 parallel forward
-        # (`_run_sequence_teacher_forced`), where it actually wins on a real GPU.
+        # recompile guard). Compile is reserved for the Phase-1 parallel tail
+        # (`_phase1_forward_cached`), where it actually wins on a real GPU.
+        # Hoist the host read of timestamps out of the T-loop (Issue 12): one
+        # tolist() instead of a per-step float(timestamps[t]) scalar extraction
+        # (and any host sync if timestamps were on GPU). Numerically identical.
+        ts = timestamps.tolist()
         estimates, outs = [], []
         for t in range(T):
-            t_val = float(timestamps[t])
+            t_val = ts[t]
             x_pred = _torch_batch_step(torch_f, x, t_val)
             y_pred = _torch_batch_step(torch_h, x_pred, t_val)
 
@@ -346,6 +368,13 @@ class KalmanNetEstimator(BaseEstimator):
     def _run_sequence_teacher_forced(self, network, observations, states, timestamps, device):
         """
         PHASE-1 (teacher-forced) forward pass, FULLY PARALLEL over T.
+
+        REFERENCE IMPLEMENTATION. As of Issue 9, fit() no longer calls this
+        directly: the weight-independent prefix (up to `inp`) is cached once per
+        fit by `_precompute_phase1_cache` and the GRU tail runs in
+        `_phase1_forward_cached`. This method is retained as the single-call eager
+        equivalent those two reproduce exactly (same x_pred/innovation/dx_prev/inp
+        construction, same GRU->fc_gain->einsum tail) -- keep them in sync.
 
         Identical filter math to `_run_sequence_vectorized`, with one change:
         every step's GRU inputs derive from the GROUND-TRUTH previous state
@@ -431,6 +460,146 @@ class KalmanNetEstimator(BaseEstimator):
         else:
             log_var_seq = None
         return estimates_seq, log_var_seq
+
+    def _precompute_phase1_cache(self, observations, states, timestamps, device):
+        """Issue 9: build the WEIGHT-INDEPENDENT prefix of the Phase-1 teacher-
+        forced forward ONCE, so the curriculum epochs reuse it instead of rerunning
+        the RK4 f/h loop every epoch. Returns (inp [N,T,ny+nx], x_pred [N,T,nx],
+        innovation [N,T,ny]) on `device`.
+
+        These are exactly the tensors `_run_sequence_teacher_forced` builds up to
+        (and including) `inp = cat([innovation, dx_prev])`, before the GRU. They
+        depend only on (states, observations, timestamps, filter_model) -- all
+        frozen for the fit -- so caching is numerically identical to recomputing.
+        The non-cacheable tail (GRU -> fc_gain -> einsum correction) still runs per
+        batch/epoch in `_phase1_forward_cached`."""
+        import torch
+        from ._neural_base import precompute_teacher_forced
+
+        if self._model.torch is None:
+            raise ValueError(
+                f"{self.estimator_name}.fit() needs FilterModel.torch (batched "
+                "torch dynamics) for vectorized GPU training; this model provides "
+                "none. Add a TorchDynamics to the level (see _torch_dynamics.py)."
+            )
+        torch_f = self._model.torch.f
+        torch_h = self._model.torch.h
+
+        # x_pred[:, t] = f(x_prev[:, t], t), y_pred[:, t] = h(x_pred[:, t], t) with
+        # x_prev = GT states shifted right by one (zeros at t=0) -- same helper the
+        # Transformer/Mamba use, same definition as the old inline loop here.
+        x_pred, y_pred = precompute_teacher_forced(torch_f, torch_h, states, timestamps)
+
+        # x_prev, x_pred_prev, innovation, dx_prev, inp -- identical to the inline
+        # construction in _run_sequence_teacher_forced.
+        x_prev = torch.zeros_like(states)
+        x_prev[:, 1:, :] = states[:, :-1, :]
+        x_pred_prev = torch.zeros_like(x_pred)
+        x_pred_prev[:, 1:, :] = x_pred[:, :-1, :]
+        innovation = observations - y_pred
+        dx_prev = x_prev - x_pred_prev
+        inp = torch.cat([innovation, dx_prev], dim=-1)
+        return inp, x_pred, innovation
+
+    def _phase1_forward_cached(self, network, inp, x_pred, innovation, device):
+        """The NON-cacheable tail of the Phase-1 teacher-forced forward: run the
+        precomputed `inp` through the GRU and gain head, apply the correction with
+        the cached teacher `x_pred`/`innovation`. Numerically identical to
+        `_run_sequence_teacher_forced`'s GRU-onward block; only the weight-
+        independent prefix has been lifted out into the per-fit cache."""
+        import torch
+
+        B, T, _ = inp.shape
+        h0 = network.init_hidden(B, device).unsqueeze(0)  # [1, B, hidden]
+        out_seq, _ = network.gru(inp, h0)                 # [B, T, hidden]
+        out_seq = network.out_norm(out_seq)
+
+        K = network.fc_gain(out_seq).view(B, T, self._nx, self._ny)
+        correction = torch.einsum("btij,btj->bti", K, innovation)
+        estimates_seq = x_pred + correction
+
+        if network.predict_log_var:
+            log_var_seq = network.fc_logvar(out_seq)
+        else:
+            log_var_seq = None
+        return estimates_seq, log_var_seq
+
+    def _run_epoch_phase1_cached(
+        self, epoch, total_epochs, network, optimizer,
+        train_loader, val_loader, device, loss_fn,
+    ):
+        """Phase-1 epoch driven by the cached (inp, x_pred, innovation, states)
+        loaders (Issue 9). Same train/val/logging structure as `_run_epoch`, but
+        the forward is the cheap `_phase1_forward_cached` tail -- no RK4 f/h rerun.
+        The DataLoader batches carry the cache in sample order (shuffle permutes
+        all tensors together), so nothing can desync."""
+        import math
+        import torch
+
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # Dispatch to the torch.compile'd tail if fit() prepared one, picking the
+        # train/eval variant by grad mode (stable guards, no recompile on the
+        # train/val flip); fall back to the eager method otherwise.
+        def _tail(inp_b, xpred_b, innov_b):
+            if torch.is_grad_enabled():
+                fn = getattr(network, "_compiled_tf_train", None)
+            else:
+                fn = getattr(network, "_compiled_tf_eval", None)
+            if fn is None:
+                return self._phase1_forward_cached(network, inp_b, xpred_b, innov_b, device)
+            return fn(network, inp_b, xpred_b, innov_b, device)
+
+        network.train()
+        train_loss_total, train_batches = 0.0, 0
+        for inp_b, xpred_b, innov_b, states_b in train_loader:
+            inp_b = inp_b.to(device)
+            xpred_b = xpred_b.to(device)
+            innov_b = innov_b.to(device)
+            states_b = states_b.to(device)
+
+            pred, log_var = _tail(inp_b, xpred_b, innov_b)
+            loss = loss_fn(pred, log_var, states_b)
+
+            if not math.isfinite(loss.item()):
+                optimizer.zero_grad()
+                continue
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(network.parameters(), self._grad_clip_norm)
+            optimizer.step()
+
+            train_loss_total += loss.item()
+            train_batches += 1
+        train_loss = train_loss_total / max(train_batches, 1)
+
+        network.eval()
+        val_loss_total, val_batches = 0.0, 0
+        with torch.no_grad():
+            for inp_b, xpred_b, innov_b, states_b in val_loader:
+                inp_b = inp_b.to(device)
+                xpred_b = xpred_b.to(device)
+                innov_b = innov_b.to(device)
+                states_b = states_b.to(device)
+                pred, log_var = _tail(inp_b, xpred_b, innov_b)
+                val_loss_total += loss_fn(pred, log_var, states_b).item()
+                val_batches += 1
+        val_loss = val_loss_total / max(val_batches, 1)
+
+        self.history_["epoch"].append(epoch + 1)
+        self.history_["train_loss"].append(train_loss)
+        self.history_["val_loss"].append(val_loss)
+        self.history_["lr"].append(current_lr)
+        self.history_["phase"].append(1)
+
+        if self._verbose:
+            print(
+                f"[{self.estimator_name}] phase 1 epoch {epoch + 1}/{total_epochs} "
+                f"train_loss={train_loss:.6f} val_loss={val_loss:.6f} lr={current_lr:.2e}"
+            )
+
+        return train_loss, val_loss, current_lr
 
     def _run_epoch(
         self,
@@ -520,25 +689,22 @@ class KalmanNetEstimator(BaseEstimator):
         device = self._training_device()
         network = self._ensure_network().to(device)
 
-        # Opt-in torch.compile of the Phase-1 teacher-forced PARALLEL forward
-        # (`_run_sequence_teacher_forced`) -- the only path where compile wins on
-        # a real GPU, since it runs the whole [B, T, *] sequence in one graph. We
-        # compile two variants -- one used under grad (train), one under no_grad
-        # (val) -- and dispatch on torch.is_grad_enabled() in Phase 1. Splitting
-        # by grad mode keeps each compiled graph's guard stable so it never
-        # recompiles when train/val alternate (a single shared object would
-        # recompile every epoch on the grad_mode guard and fall back to eager
-        # after 8). The free-running per-step path is left EAGER on purpose
-        # (compile is a net loss there). No-op on torch builds without compile,
-        # and never set on the CPU inference path (fit() clears these before the
-        # network is moved to CPU). Numerically identical -- compile only fuses
-        # kernels, it does not change the computation.
+        # Opt-in torch.compile of the Phase-1 teacher-forced tail
+        # (`_phase1_forward_cached`) -- the [B, T, *] GRU+gain graph that survives
+        # after the weight-independent prefix is cached out (Issue 9). This is the
+        # path where compile wins on a real GPU (whole sequence in one graph). We
+        # compile two variants -- one under grad (train), one under no_grad (val) --
+        # and dispatch on torch.is_grad_enabled() so each compiled guard stays
+        # stable and never recompiles when train/val alternate. The free-running
+        # per-step Phase-2 path is left EAGER on purpose (compile is a net loss
+        # there). No-op on torch builds without compile, and cleared before the CPU
+        # inference path. Numerically identical -- compile only fuses kernels.
         network._compiled_tf_train = None
         network._compiled_tf_eval = None
         if self._compile and hasattr(torch, "compile"):
             try:
-                network._compiled_tf_train = torch.compile(self._run_sequence_teacher_forced)
-                network._compiled_tf_eval = torch.compile(self._run_sequence_teacher_forced)
+                network._compiled_tf_train = torch.compile(self._phase1_forward_cached)
+                network._compiled_tf_eval = torch.compile(self._phase1_forward_cached)
             except Exception:
                 network._compiled_tf_train = None
                 network._compiled_tf_eval = None
@@ -572,20 +738,6 @@ class KalmanNetEstimator(BaseEstimator):
                 return nn.functional.gaussian_nll_loss(pred, target, var, eps=1e-6)
             return mse(pred, target)
 
-        # Phase-1 forward dispatcher: use the torch.compile'd teacher-forced
-        # graph if fit() prepared one, picking the train/eval variant by grad
-        # mode (keeps each compiled guard stable, no recompile when train/val
-        # alternate); fall back to the eager method otherwise. Signature matches
-        # _run_sequence_vectorized so both can serve as `forward_fn` in _run_epoch.
-        def _teacher_forced_forward(net, obs_b, states_b, ts, dev):
-            if torch.is_grad_enabled():
-                fn = getattr(net, "_compiled_tf_train", None)
-            else:
-                fn = getattr(net, "_compiled_tf_eval", None)
-            if fn is None:
-                return self._run_sequence_teacher_forced(net, obs_b, states_b, ts, dev)
-            return fn(net, obs_b, states_b, ts, dev)
-
         # --- per-phase runner ------------------------------------------------
         # Each phase trains independently: its own optimizer/scheduler (a fresh
         # schedule is cleaner for the fresh objective and lets cosine T_max track
@@ -594,7 +746,7 @@ class KalmanNetEstimator(BaseEstimator):
         # phase (None if no finite val loss ever beat inf). best_epoch_/
         # stopped_epoch_/_best_val_loss are left reflecting whichever phase the
         # caller runs last (Phase 2 -- the deployed model).
-        def _run_phase(phase, num_epochs, forward_fn):
+        def _run_phase(phase, num_epochs, epoch_fn):
             optimizer = torch.optim.Adam(
                 network.parameters(), lr=self._lr, weight_decay=self._weight_decay
             )
@@ -607,11 +759,9 @@ class KalmanNetEstimator(BaseEstimator):
             epochs_no_improve = 0
 
             for epoch in range(num_epochs):
-                train_loss, val_loss, current_lr = self._run_epoch(
-                    epoch, num_epochs, phase, network, optimizer,
-                    train_loader, val_loader, train_ts, val_ts, device,
-                    forward_fn, _loss,
-                )
+                # epoch_fn runs one train+val epoch and logs its history row; the
+                # bookkeeping (best-ckpt/scheduler/early-stop) is shared below.
+                train_loss, val_loss, current_lr = epoch_fn(epoch, num_epochs, optimizer)
 
                 improved = False
                 # Track best checkpoint in memory (only when loss is finite)
@@ -652,21 +802,70 @@ class KalmanNetEstimator(BaseEstimator):
         self.best_epoch_ = None
         self.stopped_epoch_ = None
 
+        # Issue 12: Phase 2 runs on its own device (default CPU). Phase-2 batches
+        # and timestamps go to phase2_device; the network is moved there just
+        # before Phase 2 (below), so the fresh Phase-2 optimizer built inside
+        # _run_phase lands on the right device.
+        phase2_device = self._phase2_device()
+
+        def _phase2_epoch(epoch, num_epochs, optimizer):
+            return self._run_epoch(
+                epoch, num_epochs, 2, network, optimizer,
+                train_loader, val_loader, train_ts, val_ts, phase2_device,
+                self._run_sequence_vectorized, _loss,
+            )
+
         # Phase 1 (teacher-forced, parallel): warm-start only. Runs for
         # curriculum_epochs epochs with its own best checkpoint; at the end we
         # load Phase 1's best weights so Phase 2 starts from them. Skipped
         # entirely when curriculum_epochs == 0 -- then fit() is the pre-curriculum
         # free-running training, and history_ holds only phase-2 rows.
         if self._curriculum_epochs > 0:
-            phase1_best = _run_phase(1, self._curriculum_epochs, _teacher_forced_forward)
+            # Issue 9: precompute the weight-independent teacher-forced prefix
+            # (inp, x_pred, innovation) ONCE on `device`, then build Phase-1-only
+            # loaders over (inp, x_pred, innovation, states). Shuffle permutes all
+            # four tensors together, so the cache stays aligned to its sample. Each
+            # curriculum epoch then runs only the cheap GRU tail -- the RK4 f/h loop
+            # no longer reruns per epoch. Numerically identical to the old Phase 1.
+            tf_train = self._precompute_phase1_cache(
+                train_obs.to(device), train_states.to(device), train_ts, device
+            )
+            tf_val = self._precompute_phase1_cache(
+                val_obs.to(device), val_states.to(device), val_ts, device
+            )
+            p1_train_loader = DataLoader(
+                TensorDataset(tf_train[0].cpu(), tf_train[1].cpu(), tf_train[2].cpu(), train_states),
+                batch_size=self._batch_size, shuffle=True,
+            )
+            p1_val_loader = DataLoader(
+                TensorDataset(tf_val[0].cpu(), tf_val[1].cpu(), tf_val[2].cpu(), val_states),
+                batch_size=self._batch_size, shuffle=False,
+            )
+
+            def _phase1_epoch(epoch, num_epochs, optimizer):
+                return self._run_epoch_phase1_cached(
+                    epoch, num_epochs, network, optimizer,
+                    p1_train_loader, p1_val_loader, device, _loss,
+                )
+
+            phase1_best = _run_phase(1, self._curriculum_epochs, _phase1_epoch)
             if phase1_best is not None:
                 network.load_state_dict(phase1_best)
+
+        # Issue 12: move the network to the Phase-2 device BEFORE Phase 2. The
+        # compiled Phase-1 graphs are device-specialized, so drop them first. Any
+        # Phase-1 best weights were already loaded above (checkpoint clones live on
+        # CPU, so that load was device-safe). The fresh Phase-2 optimizer is built
+        # inside _run_phase AFTER this move, so Adam's state lands on phase2_device.
+        network._compiled_tf_train = None
+        network._compiled_tf_eval = None
+        network.to(phase2_device)
 
         # Phase 2 (free-running): the deployed objective. Starts from Phase 1's
         # best weights (or the init when curriculum is off), with a fresh best
         # checkpoint, fresh early-stopping counter, and its own history rows.
         # best_epoch_/stopped_epoch_/_best_val_loss reflect THIS phase.
-        self._best_state_dict = _run_phase(2, self._num_epochs, self._run_sequence_vectorized)
+        self._best_state_dict = _run_phase(2, self._num_epochs, _phase2_epoch)
 
         # Load Phase-2's best checkpoint if available; otherwise keep last state.
         if self._best_state_dict is not None:
