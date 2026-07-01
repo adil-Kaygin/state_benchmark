@@ -4,7 +4,13 @@ from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 
-from ._neural_base import SequentialNeuralFilter, dt_array
+from ._neural_base import (
+    SequentialNeuralFilter,
+    dt_array,
+    angular_obs_indices,
+    wrap_innovation_torch,
+    wrap_innovation_numpy,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -237,12 +243,16 @@ class MambaEstimator(SequentialNeuralFilter):
     drop-in faster training scan with identical math, but cannot be installed
     here; the plain-torch scan is the implemented path.)
 
-    Why no curriculum (Issue 4): the selective scan is associative => parallel
-    over T at training time, so fit() runs the whole [B, T, *] sequence through
-    the scan in one pass -- no sequential T-loop over the network, no
-    teacher-forcing. (Innovation features, when on, are built from
-    GROUND-TRUTH-prev during training and model-prev at inference, like the
-    Transformer.)
+    Training regime (Issues 4 & 13): the selective scan is associative => parallel
+    over T, so the default Phase-1 pass runs the whole [B, T, *] sequence through
+    the scan in one teacher-forced pass (innovation features built from
+    GROUND-TRUTH-prev). Because inference feeds the model's OWN prev estimate,
+    teacher-forced-only training suffers exposure bias, so `curriculum_epochs > 0`
+    adds a FREE-RUNNING fine-tune for the last that-many epochs (Issue 13): a
+    sequential T-loop feeding the model's own x_hat_{t-1} into f/h exactly as
+    `_estimate_sequential_cpu` does, matching train to deployment.
+    curriculum_epochs=0 keeps the fast parallel-scan-only behavior; the
+    raw-[y,dt] branch has no exposure bias so the curriculum is a no-op there.
 
     Hardware split (Issue 0): fit()/val batched on GPU via the parallel scan;
     estimate() strictly sequential on CPU as the O(T) constant-state recurrence,
@@ -262,6 +272,7 @@ class MambaEstimator(SequentialNeuralFilter):
         use_innovation_features: bool = True,
         residual_head: bool = True,
         use_mamba_ssm_kernels: bool = True,
+        curriculum_epochs: int = 0,
         **kwargs,
     ) -> None:
         super().__init__(filter_model, **kwargs)
@@ -272,6 +283,15 @@ class MambaEstimator(SequentialNeuralFilter):
         self._n_layers = n_layers
         self._use_innovation_features = use_innovation_features
         self._residual_head = residual_head
+        # Issue 13: trailing epochs trained FREE-RUNNING (own previous estimate)
+        # to close the exposure-bias gap; 0 => parallel-scan teacher-forced only
+        # (previous behavior). No-op with use_innovation_features=False.
+        self._curriculum_epochs = curriculum_epochs
+        self._free_running_phase = False
+        # Angular (bearing) observation indices whose innovation must be wrapped
+        # to (-pi, pi] before it becomes an input feature (Issues 5/6). Empty for
+        # every scalar-observation level -> wrapping is a no-op there.
+        self._angular_idx = angular_obs_indices(filter_model, self._ny)
         # Kept for API/config compatibility; mamba_ssm cannot be installed on
         # this machine, so the plain-torch parallel scan is always used. The
         # flag is honored only insofar as the fast path is attempted if present.
@@ -297,7 +317,31 @@ class MambaEstimator(SequentialNeuralFilter):
             "use_innovation_features": self._use_innovation_features,
             "residual_head": self._residual_head,
             "use_mamba_ssm_kernels": self._use_mamba_ssm_kernels,
+            "curriculum_epochs": self._curriculum_epochs,
         }
+
+    # --- Issue 13: free-running fine-tune to close the exposure-bias gap -----
+
+    def _on_epoch_start(self, epoch: int) -> None:
+        """Enter the free-running phase for the last `curriculum_epochs` epochs
+        (only when innovation features feed state back)."""
+        self._free_running_phase = (
+            self._use_innovation_features
+            and self._curriculum_epochs > 0
+            and epoch >= self._num_epochs - self._curriculum_epochs
+        )
+
+    def _loss(self, network, observations, states, timestamps, device, feats_cache=None):
+        """Teacher-forced (parallel scan) MSE during Phase 1; free-running MSE
+        (own previous estimate fed back, matching deployment) during the
+        curriculum tail."""
+        import torch.nn.functional as F
+        if self._free_running_phase:
+            pred = self._forward_free_running(network, observations, timestamps, device)
+            return F.mse_loss(pred, states)
+        return super()._loss(
+            network, observations, states, timestamps, device, feats_cache=feats_cache
+        )
 
     # --- Issue 9: precompute the weight-independent teacher-forced features ---
 
@@ -320,8 +364,11 @@ class MambaEstimator(SequentialNeuralFilter):
         N, T, _ = observations.shape
         dt = torch.as_tensor(dt_array(timestamps), dtype=observations.dtype, device=device)
         dt_col = dt.view(1, T, 1).expand(N, T, 1)
-        x_pred, y_pred = precompute_teacher_forced(torch_f, torch_h, states, timestamps)
-        innovation = observations - y_pred
+        x_pred, y_pred = precompute_teacher_forced(
+            torch_f, torch_h, states, timestamps,
+            time_invariant=self._model.torch.time_invariant,
+        )
+        innovation = wrap_innovation_torch(observations - y_pred, self._angular_idx)
         return torch.cat([observations, innovation, x_pred, dt_col], dim=-1)
 
     # --- GPU parallel-scan forward --------------------------------------
@@ -358,7 +405,7 @@ class MambaEstimator(SequentialNeuralFilter):
         x_prev[:, 1:, :] = states[:, :-1, :]
         x_pred = torch.stack([torch_f(x_prev[:, t, :], ts[t]) for t in range(T)], dim=1)
         y_pred = torch.stack([torch_h(x_pred[:, t, :], ts[t]) for t in range(T)], dim=1)
-        innovation = observations - y_pred
+        innovation = wrap_innovation_torch(observations - y_pred, self._angular_idx)
         feats = torch.cat([observations, innovation, x_pred, dt_col], dim=-1)
         return network(feats, x_pred)
 
@@ -385,7 +432,7 @@ class MambaEstimator(SequentialNeuralFilter):
                 if self._use_innovation_features:
                     x_pred = np.asarray(f(x_prev, t_val), dtype=np.float64)
                     y_pred = np.asarray(h(x_pred, t_val), dtype=np.float64)
-                    innovation = y_t - y_pred
+                    innovation = wrap_innovation_numpy(y_t - y_pred, self._angular_idx)
                     row = np.concatenate([y_t, innovation, x_pred, [dt[t]]])
                 else:
                     x_pred = np.zeros(self._nx, dtype=np.float64)

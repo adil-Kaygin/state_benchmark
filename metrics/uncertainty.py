@@ -130,6 +130,70 @@ def compute_nees_chi2_bounds(nx: int, num_samples: int, confidence: float = 0.95
     return float(lower), float(upper)
 
 
+def compute_nees_per_trajectory(
+    estimates: np.ndarray,
+    targets: np.ndarray,
+    covariances: np.ndarray,
+) -> np.ndarray:
+    """Mean NEES per trajectory: returns an [N] array, one value per trajectory
+    (the mean over that trajectory's T timesteps). This is the per-trajectory
+    sample that metrics.aggregate summarizes to mean +/- std / 95% CI over the
+    test set, exactly like RMSE. Same validation / non-PD-P failure as
+    compute_nees (which is the whole-set mean of this)."""
+    estimates, targets, covariances, N, T, nx = _validate(estimates, targets, covariances)
+    err = targets - estimates
+    out = np.empty(N, dtype=np.float64)
+    for i in range(N):
+        total = 0.0
+        for t in range(T):
+            e = err[i, t]
+            P = covariances[i, t]
+            try:
+                solved = np.linalg.solve(P, e)
+            except np.linalg.LinAlgError as exc:
+                raise ValueError(
+                    f"covariance P at trajectory {i}, step {t} is singular and "
+                    "cannot be inverted for NEES; the filter reported an invalid "
+                    "posterior."
+                ) from exc
+            total += float(e @ solved)
+        out[i] = total / T
+    return out
+
+
+def compute_nll_per_trajectory(
+    estimates: np.ndarray,
+    targets: np.ndarray,
+    covariances: np.ndarray,
+) -> np.ndarray:
+    """Mean Gaussian NLL per trajectory: returns an [N] array (mean over the
+    trajectory's T steps). The per-trajectory sample aggregated the same way as
+    RMSE / NEES. Same non-PD-P failure as compute_nll."""
+    estimates, targets, covariances, N, T, nx = _validate(estimates, targets, covariances)
+    err = targets - estimates
+    log_2pi = np.log(2.0 * np.pi)
+    out = np.empty(N, dtype=np.float64)
+    for i in range(N):
+        total = 0.0
+        for t in range(T):
+            e = err[i, t]
+            P = covariances[i, t]
+            try:
+                L = np.linalg.cholesky(P)
+            except np.linalg.LinAlgError as exc:
+                raise ValueError(
+                    f"covariance P at trajectory {i}, step {t} is not "
+                    "positive-definite; cannot evaluate the Gaussian NLL of an "
+                    "invalid posterior."
+                ) from exc
+            z = np.linalg.solve(L, e)
+            maha = float(z @ z)
+            log_det = 2.0 * float(np.sum(np.log(np.diag(L))))
+            total += 0.5 * (maha + nx * log_2pi + log_det)
+        out[i] = total / T
+    return out
+
+
 def compute_nll(
     estimates: np.ndarray,
     targets: np.ndarray,

@@ -21,6 +21,32 @@ def _require_filterpy():
         ) from exc
 
 
+def _angular_indices(filter_model, ny: int) -> np.ndarray:
+    """Integer indices of the angular (bearing) observation components from
+    FilterModel.angular_obs_mask, or an empty array when there are none (Issues
+    5/6). Used to wrap the residual y - h(x) on the filterpy EKF/UKF paths so they
+    match the custom kernels' angle handling."""
+    mask = getattr(filter_model, "angular_obs_mask", None)
+    if mask is None:
+        return np.empty(0, dtype=np.int64)
+    mask = np.asarray(mask)
+    if mask.shape != (ny,):
+        raise ValueError(
+            f"angular_obs_mask must have shape ({ny},); got {mask.shape}."
+        )
+    return np.nonzero(mask)[0]
+
+
+def _wrap_residual(z, hx, angular_idx):
+    """Measurement residual z - hx with the angular components wrapped to
+    (-pi, pi]. filterpy's EKF/UKF accept a `residual_z`/`residual` callable of
+    exactly this signature."""
+    r = np.asarray(z, dtype=np.float64) - np.asarray(hx, dtype=np.float64)
+    for j in angular_idx:
+        r[j] = np.arctan2(np.sin(r[j]), np.cos(r[j]))
+    return r
+
+
 class FilterpyKFEstimator(BaseEstimator):
     """
     Reference KalmanFilterEstimator built on filterpy.kalman.KalmanFilter
@@ -28,6 +54,8 @@ class FilterpyKFEstimator(BaseEstimator):
     Same linearize-at-origin contract: only statistically correct on
     LinearBenchmark. Exists as an independent cross-check, not a replacement.
     """
+
+    returns_covariance = True  # Issue 7: filterpy maintains P internally.
 
     def __init__(self, filter_model: FilterModel) -> None:
         _require_filterpy()
@@ -48,7 +76,7 @@ class FilterpyKFEstimator(BaseEstimator):
     ) -> None:
         pass  # KF requires no training.
 
-    def estimate(self, dataset: TrajectoryDataset) -> np.ndarray:
+    def _run(self, dataset: TrajectoryDataset, with_cov: bool):
         from filterpy.kalman import KalmanFilter
 
         observations = np.asarray(dataset.observations)
@@ -67,6 +95,7 @@ class FilterpyKFEstimator(BaseEstimator):
         kf.R = self._model.R
 
         estimates = np.zeros((N, T, nx))
+        covs = np.zeros((N, T, nx, nx)) if with_cov else None
         for i in range(N):
             kf.x = x0_mean.copy()
             kf.P = x0_cov.copy()
@@ -74,8 +103,17 @@ class FilterpyKFEstimator(BaseEstimator):
                 kf.predict()
                 kf.update(observations[i, t])
                 estimates[i, t] = kf.x
+                if with_cov:
+                    covs[i, t] = kf.P
 
-        return estimates
+        return (estimates, covs) if with_cov else estimates
+
+    def estimate(self, dataset: TrajectoryDataset) -> np.ndarray:
+        return self._run(dataset, with_cov=False)
+
+    def estimate_with_covariance(self, dataset: TrajectoryDataset):
+        """(estimates, covariances) from filterpy's maintained P (Issue 7)."""
+        return self._run(dataset, with_cov=True)
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,6 +136,8 @@ class FilterpyEKFEstimator(BaseEstimator):
     on every (possibly time-varying) nonlinear level.
     """
 
+    returns_covariance = True  # Issue 7: filterpy maintains P internally.
+
     def __init__(self, filter_model: FilterModel) -> None:
         _require_filterpy()
         self._model = filter_model
@@ -117,7 +157,7 @@ class FilterpyEKFEstimator(BaseEstimator):
     ) -> None:
         pass  # EKF requires no training.
 
-    def estimate(self, dataset: TrajectoryDataset) -> np.ndarray:
+    def _run(self, dataset: TrajectoryDataset, with_cov: bool):
         from filterpy.kalman import ExtendedKalmanFilter
 
         observations = np.asarray(dataset.observations)
@@ -132,8 +172,11 @@ class FilterpyEKFEstimator(BaseEstimator):
         ekf = ExtendedKalmanFilter(dim_x=nx, dim_z=ny)
         ekf.Q = Q
         ekf.R = R
+        angular_idx = _angular_indices(self._model, ny)
+        residual = (lambda a, b: _wrap_residual(a, b, angular_idx)) if angular_idx.size else np.subtract
 
         estimates = np.zeros((N, T, nx))
+        covs = np.zeros((N, T, nx, nx)) if with_cov else None
         for i in range(N):
             ekf.x = x0_mean.copy()
             ekf.P = x0_cov.copy()
@@ -148,10 +191,20 @@ class FilterpyEKFEstimator(BaseEstimator):
                     observations[i, t],
                     HJacobian=lambda x, Hj=Hj: Hj,
                     Hx=lambda x: self._model.h(x),
+                    residual=residual,
                 )
                 estimates[i, t] = ekf.x
+                if with_cov:
+                    covs[i, t] = ekf.P
 
-        return estimates
+        return (estimates, covs) if with_cov else estimates
+
+    def estimate(self, dataset: TrajectoryDataset) -> np.ndarray:
+        return self._run(dataset, with_cov=False)
+
+    def estimate_with_covariance(self, dataset: TrajectoryDataset):
+        """(estimates, covariances) from filterpy's maintained P (Issue 7)."""
+        return self._run(dataset, with_cov=True)
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -187,6 +240,8 @@ class FilterpyUKFEstimator(BaseEstimator):
         self._beta = beta
         self._kappa = kappa
 
+    returns_covariance = True  # Issue 7: filterpy maintains P internally.
+
     @property
     def estimator_name(self) -> str:
         return "filterpy_ukf"
@@ -202,7 +257,7 @@ class FilterpyUKFEstimator(BaseEstimator):
     ) -> None:
         pass  # UKF requires no training.
 
-    def estimate(self, dataset: TrajectoryDataset) -> np.ndarray:
+    def _run(self, dataset: TrajectoryDataset, with_cov: bool):
         from filterpy.kalman import MerweScaledSigmaPoints, UnscentedKalmanFilter
 
         observations = np.asarray(dataset.observations)
@@ -215,8 +270,13 @@ class FilterpyUKFEstimator(BaseEstimator):
         x0_cov = self._model.x0_cov if self._model.x0_cov is not None else np.eye(nx)
 
         points = MerweScaledSigmaPoints(n=nx, alpha=self._alpha, beta=self._beta, kappa=self._kappa)
+        angular_idx = _angular_indices(self._model, ny)
+
+        def _residual_z(a, b):
+            return _wrap_residual(a, b, angular_idx)
 
         estimates = np.zeros((N, T, nx))
+        covs = np.zeros((N, T, nx, nx)) if with_cov else None
         for i in range(N):
             t_box = {"t": 0.0}
 
@@ -231,14 +291,28 @@ class FilterpyUKFEstimator(BaseEstimator):
             ukf.P = x0_cov.copy()
             ukf.Q = Q
             ukf.R = R
+            # Wrap the bearing residual to (-pi, pi] so the innovation and the
+            # measurement-covariance sigma spread are correct across the branch
+            # cut (Issues 5/6). No-op when there are no angular components.
+            if angular_idx.size:
+                ukf.residual_z = _residual_z
 
             for t in range(T):
                 t_box["t"] = float(timestamps[t])
                 ukf.predict()
                 ukf.update(observations[i, t])
                 estimates[i, t] = ukf.x
+                if with_cov:
+                    covs[i, t] = ukf.P
 
-        return estimates
+        return (estimates, covs) if with_cov else estimates
+
+    def estimate(self, dataset: TrajectoryDataset) -> np.ndarray:
+        return self._run(dataset, with_cov=False)
+
+    def estimate_with_covariance(self, dataset: TrajectoryDataset):
+        """(estimates, covariances) from filterpy's maintained P (Issue 7)."""
+        return self._run(dataset, with_cov=True)
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

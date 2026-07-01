@@ -77,9 +77,19 @@ class TorchDynamics:
     GPU-trained network and the CPU sequential estimate() see the same process
     model. Convention:
       f(x, t) -> [B, nx]   h(x, t) -> [B, ny]
+
+    time_invariant (Issue 10): True iff f/h ignore the scalar timestep t (their
+    output depends only on x). For such a level the teacher-forced precompute can
+    flatten the [B, T] grid into one [B*T] batch and call f/h ONCE instead of
+    looping T times -- exactly equal because the calls are independent and
+    t-invariant. It MUST default to False (the safe per-step path): a level whose
+    f actually uses t (e.g. nonlinear's cos(1.2*t)) would be silently corrupted by
+    flattening, which feeds a single t to every row. Only set True when f/h
+    provably drop t.
     """
     f: Callable
     h: Callable
+    time_invariant: bool = False
 
 
 @dataclass
@@ -100,6 +110,12 @@ class FilterModel:
     # training. None for levels that don't provide them (KalmanNet then cannot
     # train those levels on GPU and says so loudly).
     torch: Optional["TorchDynamics"] = None
+    # Boolean [ny] mask marking which OBSERVATION components are angles that must
+    # have their innovation y - h(x) wrapped to (-pi, pi] (Issues 5/6). None or
+    # all-False means "no angular components" (every current scalar-obs level).
+    # The classical EKF/UKF kernels and the neural innovation features consult
+    # this so a bearing residual near the +/-pi branch cut is not ~2*pi wrong.
+    angular_obs_mask: Optional[np.ndarray] = None
   
   
 class BaseSimulator(ABC):  

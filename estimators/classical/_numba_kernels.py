@@ -47,6 +47,24 @@ def _bound_cov(P: np.ndarray) -> np.ndarray:
 
 
 @njit(cache=True, fastmath=True)
+def _wrap_innovation(innov: np.ndarray, angular_mask: np.ndarray) -> np.ndarray:
+    """Wrap the angular components of an innovation vector to (-pi, pi].
+
+    angular_mask is a float [ny] with 1.0 where the observation component is an
+    angle (a bearing) and 0.0 otherwise (Issues 5/6). For those components the
+    raw residual y - h(x) can be ~2*pi wrong near the +/-pi branch cut; atan2(sin,
+    cos) folds it back onto (-pi, pi]. Non-angular components are left untouched.
+    A caller with no angular components passes an all-zero mask, which is a no-op.
+    """
+    ny = innov.shape[0]
+    out = innov.copy()
+    for j in range(ny):
+        if angular_mask[j] != 0.0:
+            out[j] = np.arctan2(np.sin(innov[j]), np.cos(innov[j]))
+    return out
+
+
+@njit(cache=True, fastmath=True)
 def _robust_chol(M: np.ndarray, nx: int, I: np.ndarray) -> np.ndarray:
     """Cholesky of a symmetric matrix that has drifted to (near-)singular.
 
@@ -65,6 +83,28 @@ def _robust_chol(M: np.ndarray, nx: int, I: np.ndarray) -> np.ndarray:
             jitter *= 10.0
     # Final attempt; let it raise if even this fails so the caller sees it.
     return np.linalg.cholesky(M + jitter * I)
+
+
+def angular_mask_float(filter_model, ny: int) -> np.ndarray:
+    """Build the float [ny] angular-observation mask (1.0 where a component is an
+    angle to wrap, else 0.0) from FilterModel.angular_obs_mask, defaulting to
+    all-zeros (no wrapping) for the scalar-observation levels. Kept here so
+    EKF/UKF (custom and filterpy) all derive the mask identically.
+
+    Raises ValueError if a provided mask has the wrong length -- a mislabelled
+    mask that silently wraps the wrong (or no) component is exactly the footgun
+    the fail-fast rule guards against.
+    """
+    mask = getattr(filter_model, "angular_obs_mask", None)
+    if mask is None:
+        return np.zeros(ny, dtype=np.float64)
+    mask = np.asarray(mask)
+    if mask.shape != (ny,):
+        raise ValueError(
+            f"angular_obs_mask must have shape ({ny},) matching the observation "
+            f"dimension; got {mask.shape}."
+        )
+    return np.ascontiguousarray(mask, dtype=np.float64)
 
 
 def assert_linear_model(f, h, F: np.ndarray, H: np.ndarray, nx: int, ny: int) -> None:
@@ -188,6 +228,7 @@ def ekf_loop(
     timestamps: np.ndarray,  # [T]
     x0: np.ndarray,  # [nx]
     P0: np.ndarray,  # [nx, nx]
+    angular_mask: np.ndarray,  # [ny] float, 1.0 where the obs is an angle
 ) -> np.ndarray:
     """General (nonlinear) EKF over one trajectory, JIT-compiled.
 
@@ -196,6 +237,10 @@ def ekf_loop(
     passed into and called from this compiled loop, so the EKF runs fully in
     machine code. This is the sole EKF implementation -- there is no pure-Python
     fallback.
+
+    angular_mask (Issues 5/6) wraps the innovation's angular (bearing) components
+    to (-pi, pi] before the update; an all-zero mask is a no-op for the existing
+    scalar-observation levels.
     """
     T, ny = observations.shape
     nx = Q.shape[0]
@@ -215,7 +260,8 @@ def ekf_loop(
         S = H @ P_pred @ H.T + R
         K = P_pred @ H.T @ np.linalg.inv(S)
 
-        x = x_pred + K @ (observations[t] - y_pred)
+        innov = _wrap_innovation(observations[t] - y_pred, angular_mask)
+        x = x_pred + K @ innov
         P = _bound_cov((I - K @ H) @ P_pred)
         estimates[t] = x
 
@@ -231,13 +277,14 @@ def ekf_loop_batch(
     timestamps: np.ndarray,  # [T]
     x0: np.ndarray,
     P0: np.ndarray,
+    angular_mask: np.ndarray,  # [ny]
 ) -> np.ndarray:
     N = observations.shape[0]
     T = observations.shape[1]
     nx = Q.shape[0]
     estimates = np.zeros((N, T, nx))
     for i in range(N):
-        estimates[i] = ekf_loop(f, h, Fj, Hj, Q, R, observations[i], timestamps, x0, P0)
+        estimates[i] = ekf_loop(f, h, Fj, Hj, Q, R, observations[i], timestamps, x0, P0, angular_mask)
     return estimates
 
 
@@ -254,12 +301,18 @@ def ukf_loop(
     kappa: float,
     x0: np.ndarray,
     P0: np.ndarray,
+    angular_mask: np.ndarray,  # [ny] float, 1.0 where the obs is an angle
 ) -> np.ndarray:
     """General (nonlinear) UKF over one trajectory, JIT-compiled.
 
     Propagates each sigma point through the benchmark's own @njit f/h, so it is
-    correct for every level (linear/pendulum/nonlinear/lorenz). This is the
-    sole UKF implementation -- there is no pure-NumPy fallback.
+    correct for every level (linear/pendulum/nonlinear/lorenz/vehicle_tracking).
+    This is the sole UKF implementation -- there is no pure-NumPy fallback.
+
+    angular_mask (Issues 5/6) wraps every measurement residual with an angular
+    (bearing) component to (-pi, pi]: both the sigma-point spreads sig_h - y_pred
+    that build S/Pxy and the final innovation y - y_pred. An all-zero mask is a
+    no-op for the existing scalar-observation levels.
     """
     T, ny = observations.shape
     nx = Q.shape[0]
@@ -320,13 +373,14 @@ def ukf_loop(
         S = R.copy()
         Pxy = np.zeros((nx, ny))
         for i in range(n_sig):
-            dy = sig_h[i] - y_pred
+            dy = _wrap_innovation(sig_h[i] - y_pred, angular_mask)
             dx = sig_f[i] - x_pred
             S += Wc[i] * np.outer(dy, dy)
             Pxy += Wc[i] * np.outer(dx, dy)
 
         K = Pxy @ np.linalg.inv(S)
-        x = x_pred + K @ (observations[t] - y_pred)
+        innov = _wrap_innovation(observations[t] - y_pred, angular_mask)
+        x = x_pred + K @ innov
         P = P_pred - K @ S @ K.T
         P = 0.5 * (P + P.T)  # keep symmetric against numerical drift
         estimates[t] = x
@@ -346,6 +400,7 @@ def ukf_loop_batch(
     kappa: float,
     x0: np.ndarray,
     P0: np.ndarray,
+    angular_mask: np.ndarray,  # [ny]
 ) -> np.ndarray:
     N = observations.shape[0]
     T = observations.shape[1]
@@ -353,7 +408,201 @@ def ukf_loop_batch(
     estimates = np.zeros((N, T, nx))
     for i in range(N):
         estimates[i] = ukf_loop(
-            f, h, Q, R, observations[i], timestamps, alpha, beta, kappa, x0, P0
+            f, h, Q, R, observations[i], timestamps, alpha, beta, kappa, x0, P0, angular_mask
         )
     return estimates
+
+
+# --- Covariance-returning variants (Issue 7) --------------------------------
+#
+# These mirror the point-estimate loops above one-for-one but ALSO record the
+# posterior covariance P at every step, so estimate_with_covariance() can feed
+# NEES/NLL. The filter math is identical; the only addition is `covs[t] = P`.
+# Kept as separate kernels (rather than always returning P) so the hot point-
+# estimate path stays allocation-light and estimate() is unchanged.
+
+
+@njit(cache=True, fastmath=True)
+def kf_loop_cov(F, H, Q, R, observations, x0, P0):
+    """Linear KF over one trajectory, returning (estimates [T,nx], covs [T,nx,nx])
+    -- the posterior P after each update. Same recursion as kf_loop."""
+    T, ny = observations.shape
+    nx = Q.shape[0]
+    estimates = np.zeros((T, nx))
+    covs = np.zeros((T, nx, nx))
+
+    x = x0.copy()
+    P = P0.copy()
+    I = np.eye(nx)
+    Ht = H.T
+
+    for t in range(T):
+        x_pred = F @ x
+        P_pred = _bound_cov(F @ P @ F.T + Q)
+
+        y = observations[t]
+        S = H @ P_pred @ Ht + R
+        K = P_pred @ Ht @ np.linalg.inv(S)
+        x = x_pred + K @ (y - H @ x_pred)
+        P = _bound_cov((I - K @ H) @ P_pred)
+        estimates[t] = x
+        covs[t] = P
+
+    return estimates, covs
+
+
+@njit(cache=True, fastmath=True)
+def kf_loop_batch_cov(F, H, Q, R, observations, x0, P0):
+    N = observations.shape[0]
+    T, ny = observations.shape[1], observations.shape[2]
+    nx = Q.shape[0]
+    estimates = np.zeros((N, T, nx))
+    covs = np.zeros((N, T, nx, nx))
+    for i in range(N):
+        est_i, cov_i = kf_loop_cov(F, H, Q, R, observations[i], x0, P0)
+        estimates[i] = est_i
+        covs[i] = cov_i
+    return estimates, covs
+
+
+@njit(cache=True, fastmath=True)
+def ekf_loop_cov(f, h, Fj, Hj, Q, R, observations, timestamps, x0, P0, angular_mask):
+    """EKF over one trajectory, returning (estimates [T,nx], covs [T,nx,nx]).
+    Same recursion as ekf_loop (incl. the angular innovation wrap)."""
+    T, ny = observations.shape
+    nx = Q.shape[0]
+    estimates = np.zeros((T, nx))
+    covs = np.zeros((T, nx, nx))
+
+    x = x0.copy()
+    P = P0.copy()
+    I = np.eye(nx)
+
+    for t in range(T):
+        x_pred = f(x, timestamps[t])
+        F = Fj(x)
+        P_pred = _bound_cov(F @ P @ F.T + Q)
+
+        H = Hj(x_pred)
+        y_pred = h(x_pred, timestamps[t])
+        S = H @ P_pred @ H.T + R
+        K = P_pred @ H.T @ np.linalg.inv(S)
+
+        innov = _wrap_innovation(observations[t] - y_pred, angular_mask)
+        x = x_pred + K @ innov
+        P = _bound_cov((I - K @ H) @ P_pred)
+        estimates[t] = x
+        covs[t] = P
+
+    return estimates, covs
+
+
+@njit(cache=True, fastmath=True)
+def ekf_loop_batch_cov(f, h, Fj, Hj, Q, R, observations, timestamps, x0, P0, angular_mask):
+    N = observations.shape[0]
+    T = observations.shape[1]
+    nx = Q.shape[0]
+    estimates = np.zeros((N, T, nx))
+    covs = np.zeros((N, T, nx, nx))
+    for i in range(N):
+        est_i, cov_i = ekf_loop_cov(
+            f, h, Fj, Hj, Q, R, observations[i], timestamps, x0, P0, angular_mask
+        )
+        estimates[i] = est_i
+        covs[i] = cov_i
+    return estimates, covs
+
+
+@njit(cache=True, fastmath=True)
+def ukf_loop_cov(f, h, Q, R, observations, timestamps, alpha, beta, kappa, x0, P0, angular_mask):
+    """UKF over one trajectory, returning (estimates [T,nx], covs [T,nx,nx]).
+    Same recursion as ukf_loop (incl. the angular residual wrap)."""
+    T, ny = observations.shape
+    nx = Q.shape[0]
+    n_sig = 2 * nx + 1
+
+    lam = alpha * alpha * (nx + kappa) - nx
+    c = nx + lam
+    Wm = np.empty(n_sig)
+    Wc = np.empty(n_sig)
+    Wm[0] = lam / c
+    Wc[0] = lam / c + (1.0 - alpha * alpha + beta)
+    for i in range(1, n_sig):
+        Wm[i] = 1.0 / (2.0 * c)
+        Wc[i] = 1.0 / (2.0 * c)
+
+    estimates = np.zeros((T, nx))
+    covs = np.zeros((T, nx, nx))
+    x = x0.copy()
+    P = P0.copy()
+    I = np.eye(nx)
+
+    for t in range(T):
+        P = 0.5 * (P + P.T)
+        M = c * P
+        try:
+            sqrtP = np.linalg.cholesky(M)
+        except Exception:
+            sqrtP = _robust_chol(M, nx, I)
+
+        sigmas = np.empty((n_sig, nx))
+        sigmas[0] = x
+        for i in range(nx):
+            col = sqrtP[:, i]
+            sigmas[i + 1] = x + col
+            sigmas[nx + i + 1] = x - col
+
+        sig_f = np.empty((n_sig, nx))
+        for i in range(n_sig):
+            sig_f[i] = f(sigmas[i], timestamps[t])
+
+        x_pred = np.zeros(nx)
+        for i in range(n_sig):
+            x_pred += Wm[i] * sig_f[i]
+        P_pred = Q.copy()
+        for i in range(n_sig):
+            d = sig_f[i] - x_pred
+            P_pred += Wc[i] * np.outer(d, d)
+
+        sig_h = np.empty((n_sig, ny))
+        for i in range(n_sig):
+            sig_h[i] = h(sig_f[i], timestamps[t])
+
+        y_pred = np.zeros(ny)
+        for i in range(n_sig):
+            y_pred += Wm[i] * sig_h[i]
+
+        S = R.copy()
+        Pxy = np.zeros((nx, ny))
+        for i in range(n_sig):
+            dy = _wrap_innovation(sig_h[i] - y_pred, angular_mask)
+            dx = sig_f[i] - x_pred
+            S += Wc[i] * np.outer(dy, dy)
+            Pxy += Wc[i] * np.outer(dx, dy)
+
+        K = Pxy @ np.linalg.inv(S)
+        innov = _wrap_innovation(observations[t] - y_pred, angular_mask)
+        x = x_pred + K @ innov
+        P = P_pred - K @ S @ K.T
+        P = 0.5 * (P + P.T)
+        estimates[t] = x
+        covs[t] = P
+
+    return estimates, covs
+
+
+@njit(cache=True, fastmath=True)
+def ukf_loop_batch_cov(f, h, Q, R, observations, timestamps, alpha, beta, kappa, x0, P0, angular_mask):
+    N = observations.shape[0]
+    T = observations.shape[1]
+    nx = Q.shape[0]
+    estimates = np.zeros((N, T, nx))
+    covs = np.zeros((N, T, nx, nx))
+    for i in range(N):
+        est_i, cov_i = ukf_loop_cov(
+            f, h, Q, R, observations[i], timestamps, alpha, beta, kappa, x0, P0, angular_mask
+        )
+        estimates[i] = est_i
+        covs[i] = cov_i
+    return estimates, covs
 

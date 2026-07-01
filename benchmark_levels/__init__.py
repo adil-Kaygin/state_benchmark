@@ -3,6 +3,7 @@ from .linear import LinearBenchmark
 from .pendulum import PendulumBenchmark
 from .lorenz import LorenzBenchmark, LorenzFEABenchmark
 from .nonlinear import NonlinearBenchmark
+from .vehicle_tracking import VehicleTrackingBenchmark
 
 BENCHMARK_LEVELS = {
     "linear": LinearBenchmark,
@@ -10,6 +11,7 @@ BENCHMARK_LEVELS = {
     "lorenz": LorenzBenchmark,
     "lorenz_fea": LorenzFEABenchmark,
     "nonlinear": NonlinearBenchmark,
+    "vehicle_tracking": VehicleTrackingBenchmark,
 }
 
 __all__ = [
@@ -23,5 +25,6 @@ __all__ = [
     "LorenzBenchmark",
     "LorenzFEABenchmark",
     "NonlinearBenchmark",
+    "VehicleTrackingBenchmark",
     "BENCHMARK_LEVELS",
 ]

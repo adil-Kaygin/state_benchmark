@@ -92,3 +92,27 @@ def aggregate_rmse_per_dim_over_trajectories(
             raise ValueError(f"variable {var!r} has no per-trajectory RMSE samples.")
         out[var] = summarize_samples(arr)
     return out
+
+
+def aggregate_uncertainty_over_trajectories(
+    nees_per_traj: Sequence[float],
+    nll_per_traj: Sequence[float],
+) -> Dict[str, Dict[str, float]]:
+    """Aggregate per-trajectory NEES / NLL into mean +/- std / 95% CI over the
+    test trajectories (Issue 7), the SAME single-test-set treatment as RMSE.
+
+    Parameters
+    ----------
+    nees_per_traj : [N] per-trajectory mean NEES (metrics.uncertainty.
+        compute_nees_per_trajectory).
+    nll_per_traj  : [N] per-trajectory mean NLL (compute_nll_per_trajectory).
+
+    Returns
+    -------
+    {"nees": {"mean","std","ci95","n"}, "nll": {...}}.
+    """
+    nees = np.asarray(list(nees_per_traj), dtype=np.float64)
+    nll = np.asarray(list(nll_per_traj), dtype=np.float64)
+    if nees.size == 0 or nll.size == 0:
+        raise ValueError("NEES/NLL per-trajectory arrays must be non-empty.")
+    return {"nees": summarize_samples(nees), "nll": summarize_samples(nll)}

@@ -223,3 +223,71 @@ def build_lorenz_fea_numba_dynamics(sigma: float, rho: float, beta: float, dt: f
         return np.eye(3) + dt * _field_jac(x)
 
     return NumbaDynamics(f=f, h=h, F_jac=F_jac, H_jac=H_jac)
+
+
+# Floor on the sensor-to-target range so the bearing Jacobian (dx/r^2, dy/r^2)
+# and range Jacobian (dx/r, dy/r) cannot divide by zero if the target passes
+# exactly over a sensor. The true range is essentially never this small, so the
+# floor never distorts a real measurement -- it only guards the degenerate r=0.
+_VT_RANGE_EPS = 1.0e-9
+
+
+def build_vehicle_tracking_numba_dynamics(sensors: np.ndarray, dt: float) -> NumbaDynamics:
+    """@njit dynamics for the multi-sensor range/bearing vehicle-tracking level
+    (Issue 6). Mirrors the pure-NumPy f/h/F/H in vehicle_tracking.py one-for-one.
+
+    State x = [px, py, vx, vy] (nx=4); K sensors at rows of `sensors` [K, 2] each
+    emit [range, bearing], stacked into y in R^{2K} (ny=2K). f is the constant-
+    velocity map (F is the constant CV matrix); h is the stacked polar readout;
+    H stacks the per-sensor [2, 4] Jacobian blocks. Bearings are wrapped to
+    (-pi, pi] wherever an innovation is formed, NOT inside h (the emitted/observed
+    bearing already lives on (-pi, pi] from atan2)."""
+    sensors_c = np.ascontiguousarray(sensors, dtype=np.float64)
+    K = sensors_c.shape[0]
+    eps = _VT_RANGE_EPS
+
+    # Constant CV transition matrix, baked in.
+    F_cv = np.eye(4)
+    F_cv[0, 2] = dt
+    F_cv[1, 3] = dt
+    F_cv = np.ascontiguousarray(F_cv)
+
+    @njit(cache=True, fastmath=True)
+    def f(x, t):
+        return F_cv @ x
+
+    @njit(cache=True, fastmath=True)
+    def h(x, t):
+        out = np.empty(2 * K)
+        for k in range(K):
+            dx = x[0] - sensors_c[k, 0]
+            dy = x[1] - sensors_c[k, 1]
+            r = np.sqrt(dx * dx + dy * dy)
+            out[2 * k] = r
+            out[2 * k + 1] = np.arctan2(dy, dx)
+        return out
+
+    @njit(cache=True, fastmath=True)
+    def F_jac(x):
+        return F_cv
+
+    @njit(cache=True, fastmath=True)
+    def H_jac(x):
+        H = np.zeros((2 * K, 4))
+        for k in range(K):
+            dx = x[0] - sensors_c[k, 0]
+            dy = x[1] - sensors_c[k, 1]
+            r2 = dx * dx + dy * dy
+            r = np.sqrt(r2)
+            if r < eps:
+                r = eps
+                r2 = eps * eps
+            # d range / d(px, py)
+            H[2 * k, 0] = dx / r
+            H[2 * k, 1] = dy / r
+            # d bearing / d(px, py)
+            H[2 * k + 1, 0] = -dy / r2
+            H[2 * k + 1, 1] = dx / r2
+        return H
+
+    return NumbaDynamics(f=f, h=h, F_jac=F_jac, H_jac=H_jac)

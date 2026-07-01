@@ -8,7 +8,12 @@ from typing import Optional, TYPE_CHECKING
 import numpy as np
 
 from ..base import BaseEstimator
-from ._neural_base import _atomic_torch_save
+from ._neural_base import (
+    _atomic_torch_save,
+    angular_obs_indices,
+    wrap_innovation_torch,
+    wrap_innovation_numpy,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -182,6 +187,10 @@ class KalmanNetEstimator(BaseEstimator):
         self._model = filter_model
         self._nx = filter_model.Q.shape[0]
         self._ny = filter_model.R.shape[0]
+        # Angular (bearing) observation indices whose innovation y - h(x_pred)
+        # must be wrapped to (-pi, pi] before it drives the GRU gain (Issues 5/6).
+        # Empty for every scalar-observation level -> wrapping is a no-op there.
+        self._angular_idx = angular_obs_indices(filter_model, self._ny)
         self._hidden_size = hidden_size
         self._lr = learning_rate
         self._num_epochs = num_epochs
@@ -341,7 +350,7 @@ class KalmanNetEstimator(BaseEstimator):
             x_pred = _torch_batch_step(torch_f, x, t_val)
             y_pred = _torch_batch_step(torch_h, x_pred, t_val)
 
-            innovation = observations[:, t, :] - y_pred
+            innovation = wrap_innovation_torch(observations[:, t, :] - y_pred, self._angular_idx)
             dx_prev = x - x_pred_prev
 
             K, out, h = network.step(innovation, dx_prev, h)
@@ -439,7 +448,7 @@ class KalmanNetEstimator(BaseEstimator):
         x_pred_prev = torch.zeros_like(x_pred)
         x_pred_prev[:, 1:, :] = x_pred[:, :-1, :]
 
-        innovation = observations - y_pred            # [B, T, ny]
+        innovation = wrap_innovation_torch(observations - y_pred, self._angular_idx)  # [B, T, ny]
         dx_prev = x_prev - x_pred_prev                # [B, T, nx]
 
         # Single parallel GRU call over the whole trajectory: h0 is the same
@@ -488,7 +497,10 @@ class KalmanNetEstimator(BaseEstimator):
         # x_pred[:, t] = f(x_prev[:, t], t), y_pred[:, t] = h(x_pred[:, t], t) with
         # x_prev = GT states shifted right by one (zeros at t=0) -- same helper the
         # Transformer/Mamba use, same definition as the old inline loop here.
-        x_pred, y_pred = precompute_teacher_forced(torch_f, torch_h, states, timestamps)
+        x_pred, y_pred = precompute_teacher_forced(
+            torch_f, torch_h, states, timestamps,
+            time_invariant=self._model.torch.time_invariant,
+        )
 
         # x_prev, x_pred_prev, innovation, dx_prev, inp -- identical to the inline
         # construction in _run_sequence_teacher_forced.
@@ -496,7 +508,7 @@ class KalmanNetEstimator(BaseEstimator):
         x_prev[:, 1:, :] = states[:, :-1, :]
         x_pred_prev = torch.zeros_like(x_pred)
         x_pred_prev[:, 1:, :] = x_pred[:, :-1, :]
-        innovation = observations - y_pred
+        innovation = wrap_innovation_torch(observations - y_pred, self._angular_idx)
         dx_prev = x_prev - x_pred_prev
         inp = torch.cat([innovation, dx_prev], dim=-1)
         return inp, x_pred, innovation
@@ -917,7 +929,9 @@ class KalmanNetEstimator(BaseEstimator):
                 x_pred = torch.from_numpy(x_pred_np).to(observations.dtype).unsqueeze(0)
                 y_pred = torch.from_numpy(y_pred_np).to(observations.dtype).unsqueeze(0)
 
-                innovation = observations[i, t, :].unsqueeze(0) - y_pred
+                innovation = wrap_innovation_torch(
+                    observations[i, t, :].unsqueeze(0) - y_pred, self._angular_idx
+                )
                 dx_prev = x - x_pred_prev
 
                 K, out, hidden = network.step(innovation, dx_prev, hidden)

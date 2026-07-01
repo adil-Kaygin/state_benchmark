@@ -36,7 +36,8 @@ def build_linear_torch_dynamics(F_mat, H_mat) -> TorchDynamics:
         H = torch.as_tensor(H_np, dtype=x.dtype, device=x.device)
         return x @ H.T  # [B, ny]
 
-    return TorchDynamics(f=f, h=h)
+    # Linear f/h are x @ F.T / x @ H.T -- t is never read (Issue 10).
+    return TorchDynamics(f=f, h=h, time_invariant=True)
 
 
 def build_pendulum_torch_dynamics(g: float, length: float, dt: float) -> TorchDynamics:
@@ -52,7 +53,8 @@ def build_pendulum_torch_dynamics(g: float, length: float, dt: float) -> TorchDy
     def h(x, t=0.0):
         return x[:, 0:1]  # [B, 1]
 
-    return TorchDynamics(f=f, h=h)
+    # Pendulum f uses only the baked-in dt (not t) and h is a slice (Issue 10).
+    return TorchDynamics(f=f, h=h, time_invariant=True)
 
 
 def build_nonlinear_torch_dynamics() -> TorchDynamics:
@@ -95,4 +97,42 @@ def build_lorenz_torch_dynamics(sigma: float, rho: float, beta: float, dt: float
     def h(x, t=0.0):
         return x[:, 0:2]  # [B, 2]
 
-    return TorchDynamics(f=f, h=h)
+    # The RK4 step uses only the baked-in dt, never the scalar t (Issue 10).
+    return TorchDynamics(f=f, h=h, time_invariant=True)
+
+
+def build_vehicle_tracking_torch_dynamics(sensors, dt: float) -> TorchDynamics:
+    """Batched torch dynamics for the multi-sensor range/bearing vehicle-tracking
+    level (Issue 6). f: [B,4]->[B,4] constant-velocity; h: [B,4]->[B,2K] stacked
+    range/bearing. Math is identical to the NumPy / @njit paths (torch.atan2 /
+    torch.sqrt). t is unused (constant-velocity + polar readout) -> time_invariant.
+    """
+    import numpy as np
+
+    sensors_np = np.ascontiguousarray(sensors, dtype=np.float64)
+    K = sensors_np.shape[0]
+
+    F_np = np.eye(4)
+    F_np[0, 2] = dt
+    F_np[1, 3] = dt
+    F_np = np.ascontiguousarray(F_np)
+
+    def f(x, t=0.0):
+        import torch
+        F = torch.as_tensor(F_np, dtype=x.dtype, device=x.device)
+        return x @ F.T  # [B, 4]
+
+    def h(x, t=0.0):
+        import torch
+        S = torch.as_tensor(sensors_np, dtype=x.dtype, device=x.device)  # [K, 2]
+        px = x[:, 0:1]  # [B, 1]
+        py = x[:, 1:2]
+        dx = px - S[:, 0].unsqueeze(0)  # [B, K]
+        dy = py - S[:, 1].unsqueeze(0)  # [B, K]
+        r = torch.sqrt(dx * dx + dy * dy)          # [B, K]
+        bearing = torch.atan2(dy, dx)              # [B, K]
+        # Interleave [r_0, b_0, r_1, b_1, ...] -> [B, 2K] to match the stacked h.
+        out = torch.stack([r, bearing], dim=2).reshape(x.shape[0], 2 * K)
+        return out
+
+    return TorchDynamics(f=f, h=h, time_invariant=True)

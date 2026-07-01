@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from datasets.schema import TrajectoryDataset
 
 
-def precompute_teacher_forced(torch_f, torch_h, states, timestamps):
+def precompute_teacher_forced(torch_f, torch_h, states, timestamps, time_invariant=False):
     """Build the weight-INDEPENDENT teacher-forced predictions for a whole batch
     of trajectories in one shot (Issue 9).
 
@@ -44,14 +44,30 @@ def precompute_teacher_forced(torch_f, torch_h, states, timestamps):
     numerically IDENTICAL to recomputing (same bits, no gradients flow through it:
     the inputs are ground-truth constants), it only removes redundant work.
 
-    f/h take a SCALAR t per step (the nonlinear level's f uses cos(1.2*t)), so t
-    cannot be folded into one [B*T] call in general -- the per-step stack stays.
-    The point is to run this loop ONCE per fit, not once per epoch."""
+    Time axis (Issue 10). f/h take a SCALAR t per step. When the level's f/h
+    depend on t (nonlinear's cos(1.2*t)), t cannot be folded into one call, so we
+    keep the per-step stack. But for a `time_invariant` level (linear / pendulum /
+    lorenz -- t is ignored, only the baked-in dt matters), the whole T-loop
+    collapses: flatten [B, T, nx] -> [B*T, nx], call f ONCE, reshape back (and
+    likewise h). This is EXACTLY equal to the per-step path because every call is
+    independent and t-invariant; it turns T kernel-launch sets into one. The
+    representative t passed to the flat call (ts[0]) is ignored by construction.
+
+    `time_invariant` MUST default to False so a new/forgotten level takes the safe
+    per-step path -- flattening a genuinely t-dependent f would feed one t to all
+    B*T rows and silently corrupt it. Read from TorchDynamics.time_invariant."""
     import torch
     B, T, nx = states.shape
     x_prev = torch.zeros_like(states)
     x_prev[:, 1:, :] = states[:, :-1, :]
     ts = timestamps.tolist()
+    if time_invariant:
+        # reshape (not view): x_prev[:, 1:] is contiguous but be defensive so a
+        # non-contiguous input can never raise. t is ignored -> pass ts[0].
+        t0 = ts[0]
+        x_pred = torch_f(x_prev.reshape(B * T, nx), t0).reshape(B, T, -1)
+        y_pred = torch_h(x_pred.reshape(B * T, x_pred.shape[-1]), t0).reshape(B, T, -1)
+        return x_pred, y_pred
     x_pred = torch.stack([torch_f(x_prev[:, t, :], ts[t]) for t in range(T)], dim=1)
     y_pred = torch.stack([torch_h(x_pred[:, t, :], ts[t]) for t in range(T)], dim=1)
     return x_pred, y_pred
@@ -155,6 +171,67 @@ class SequentialNeuralFilter(BaseEstimator):
         before (unchanged behavior)."""
         raise NotImplementedError
 
+    def _forward_free_running(self, network, observations, timestamps, device):
+        """FREE-RUNNING forward for the exposure-bias fine-tune (Issue 13).
+
+        Builds the innovation feature at each step from the network's OWN previous
+        estimate x_hat_{t-1} -- exactly the construction `_estimate_sequential_cpu`
+        uses at deployment -- instead of the ground-truth previous state. It is a
+        sequential T-loop (the irreducible cost of matching train to inference for
+        the parallel models), kept differentiable and on `device` so the gradient
+        flows through the fed-back state, and it reuses the network's own parallel
+        `forward(feats, x_pred)` on the growing prefix (taking the last position as
+        x_hat_t), so it stays consistent with the teacher-forced path's math.
+
+        Only defined for the innovation-feature filters (Transformer / Mamba). It
+        requires the estimator to expose `_use_innovation_features`, `_angular_idx`,
+        and `filter_model.torch`; a subclass without those should not call it.
+        Returns x_hat [B, T, nx].
+        """
+        import torch
+
+        B, T, ny = observations.shape
+        nx = self._nx
+        use_innov = getattr(self, "_use_innovation_features", False)
+        angular_idx = getattr(self, "_angular_idx", np.empty(0, dtype=np.int64))
+        dt = torch.as_tensor(dt_array(timestamps), dtype=observations.dtype, device=device)
+
+        if use_innov:
+            self._require_torch_dynamics()
+            torch_f = self._model.torch.f
+            torch_h = self._model.torch.h
+            ts = timestamps.tolist()
+
+        x_prev = torch.zeros(B, nx, device=device, dtype=observations.dtype)  # own x_hat_{t-1}
+        feat_rows = []   # list of [B, in_features]
+        xpred_rows = []  # list of [B, nx]
+        x_hats = []      # list of [B, nx]
+
+        for t in range(T):
+            y_t = observations[:, t, :]  # [B, ny]
+            if use_innov:
+                t_val = ts[t]
+                x_pred = torch_f(x_prev, t_val)                # [B, nx]
+                y_pred = torch_h(x_pred, t_val)                # [B, ny]
+                innovation = wrap_innovation_torch(y_t - y_pred, angular_idx)
+                dt_col = dt[t].view(1, 1).expand(B, 1)
+                row = torch.cat([y_t, innovation, x_pred, dt_col], dim=-1)
+            else:
+                x_pred = torch.zeros(B, nx, device=device, dtype=observations.dtype)
+                dt_col = dt[t].view(1, 1).expand(B, 1)
+                row = torch.cat([y_t, dt_col], dim=-1)
+            feat_rows.append(row)
+            xpred_rows.append(x_pred)
+
+            feats = torch.stack(feat_rows, dim=1)     # [B, t+1, in_features]
+            xpred = torch.stack(xpred_rows, dim=1)     # [B, t+1, nx]
+            x_hat_seq = network(feats, xpred)          # [B, t+1, nx]
+            x_hat = x_hat_seq[:, -1, :]                # last position = x_hat_t
+            x_hats.append(x_hat)
+            x_prev = x_hat                             # feed own output forward
+
+        return torch.stack(x_hats, dim=1)              # [B, T, nx]
+
     def _loss(self, network, observations, states, timestamps, device, feats_cache=None):
         """Default training loss: MSE of the batched forward vs ground truth.
         Override (e.g. PINN) to add physics residual terms.
@@ -198,6 +275,13 @@ class SequentialNeuralFilter(BaseEstimator):
         innovation mode) override this; everyone else leaves it None. Only called
         when `_wants_feats_cache()` is True."""
         return None
+
+    def _on_epoch_start(self, epoch: int) -> None:
+        """Hook called by fit() at the start of each epoch (0-based). Default
+        no-op. Subclasses with a training-regime curriculum (Issue 13:
+        Transformer/Mamba free-running fine-tune) override it to flip a phase
+        flag their `_loss` reads."""
+        pass
 
     def _estimate_sequential_cpu(self, network, observations, timestamps):
         """Strictly sequential CPU inference: one trajectory / one timestep at a
@@ -316,6 +400,12 @@ class SequentialNeuralFilter(BaseEstimator):
 
         for epoch in range(self._num_epochs):
             current_lr = optimizer.param_groups[0]["lr"]
+
+            # Phase hook (Issue 13): lets a subclass switch training regime by
+            # epoch -- e.g. Transformer/Mamba anneal from a parallel teacher-forced
+            # warm-start into a sequential free-running phase for the last
+            # `curriculum_epochs`, matching how they are deployed. Default no-op.
+            self._on_epoch_start(epoch)
 
             network.train()
             train_loss_total, train_batches = 0.0, 0
@@ -443,6 +533,46 @@ class SequentialNeuralFilter(BaseEstimator):
             "with the saved hyperparameters, then call load_weights(path) on it "
             "(or torch.load(path) and load_state_dict() on its network)."
         )
+
+
+def angular_obs_indices(filter_model, ny: int) -> np.ndarray:
+    """Integer indices of the angular (bearing) observation components from
+    FilterModel.angular_obs_mask, empty when there are none (Issues 5/6). The
+    neural filters use the innovation y - h(x_pred) as an INPUT feature; a
+    bearing residual must be wrapped to (-pi, pi] there too, or the network trains
+    on ~2*pi-wrong values near the branch cut. Returns np.int64 indices; an empty
+    array => no wrapping (every current scalar-observation level)."""
+    mask = getattr(filter_model, "angular_obs_mask", None)
+    if mask is None:
+        return np.empty(0, dtype=np.int64)
+    mask = np.asarray(mask)
+    if mask.shape != (ny,):
+        raise ValueError(f"angular_obs_mask must have shape ({ny},); got {mask.shape}.")
+    return np.nonzero(mask)[0]
+
+
+def wrap_innovation_torch(innovation, angular_idx):
+    """Wrap the angular components of a torch innovation tensor [..., ny] to
+    (-pi, pi] via atan2(sin, cos). No-op when angular_idx is empty. Returns a new
+    tensor; does not mutate the input."""
+    if len(angular_idx) == 0:
+        return innovation
+    import torch
+    out = innovation.clone()
+    idx = torch.as_tensor(np.asarray(angular_idx), dtype=torch.long, device=innovation.device)
+    ang = innovation.index_select(-1, idx)
+    out.index_copy_(-1, idx, torch.atan2(torch.sin(ang), torch.cos(ang)))
+    return out
+
+
+def wrap_innovation_numpy(innovation: np.ndarray, angular_idx: np.ndarray) -> np.ndarray:
+    """NumPy counterpart of wrap_innovation_torch for the sequential CPU inference
+    path. Wraps innovation[..., angular_idx] to (-pi, pi]; no-op when empty."""
+    if len(angular_idx) == 0:
+        return innovation
+    out = np.array(innovation, dtype=np.float64, copy=True)
+    out[..., angular_idx] = np.arctan2(np.sin(out[..., angular_idx]), np.cos(out[..., angular_idx]))
+    return out
 
 
 def dt_array(timestamps: np.ndarray) -> np.ndarray:
