@@ -21,10 +21,15 @@
 # %%
 # On Colab, mount + clone + install exactly like the experiment notebooks.
 # Locally (with the repo importable and torch installed) skip this cell.
+#
+# IMPORTANT: to profile the speedup changes, clone the BRANCH that has them
+# (--branch below), not the default main -- main does not have Issues 9/11/12.
+# Change BRANCH to whatever you want to compare (e.g. "main" for the baseline).
+# BRANCH = "perf/neural-training-speedups-issues-9-11-12-14"
 # from google.colab import drive
 # drive.mount('/content/drive')
 # !rm -rf ./state_benchmark/
-# !git clone https://github.com/adil-Kaygin/state_benchmark.git
+# !git clone --branch {BRANCH} https://github.com/adil-Kaygin/state_benchmark.git
 # !pip install ./state_benchmark
 
 # %%
