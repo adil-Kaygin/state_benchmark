@@ -121,10 +121,36 @@ class PINNFilterEstimator(SequentialNeuralFilter):
 
     # --- GPU batched forward + physics-informed loss --------------------
 
-    def _forward_train(self, network, observations, states, timestamps, device):
+    def _forward_train(self, network, observations, states, timestamps, device,
+                       feats_cache=None):
         """Free-running causal recursion over the batch, returning x_hat
         [B, T, nx]. Parallel over B; the T loop is the filter's intrinsic
-        recurrence. Uses the batched torch f/h to build the innovation."""
+        recurrence. Uses the batched torch f/h to build the innovation.
+
+        Thin wrapper over `_forward_train_fused` for the default MSE-only path.
+        feats_cache is unused (free-running forward is not cacheable); accepted
+        only to match the base signature."""
+        x_hat, _, _ = self._forward_train_fused(
+            network, observations, states, timestamps, device,
+            want_dyn=False, want_meas=False,
+        )
+        return x_hat
+
+    def _forward_train_fused(self, network, observations, states, timestamps,
+                             device, want_dyn, want_meas):
+        """Single-pass forward that ALSO folds the physics residuals into the one
+        T-loop it already runs (Issue 11), instead of two extra standalone
+        T-loops in `_loss`. Returns (x_hat [B,T,nx], f_prev or None, h_hat or None):
+
+          f_prev[:, t-1] = f(x_hat_{t-1}, ts[t-1])   for t = 1..T-1  (want_dyn)
+          h_hat[:, t]    = h(x_hat_t,     ts[t])      for t = 0..T-1  (want_meas)
+
+        These are exactly the tensors the old `_loss` built in its separate loops
+        (`f_prev` = f over x_hat[:, :-1]; `h_hat` = h over x_hat), so the derived
+        r_dyn/r_meas and the loss are numerically identical -- only the loop
+        structure changed. When a want_* flag is False (the lambda==0 ablation)
+        that residual's f/h is never evaluated, matching the old short-circuit.
+        """
         import torch
 
         self._require_torch_dynamics()
@@ -136,6 +162,12 @@ class PINNFilterEstimator(SequentialNeuralFilter):
         x = torch.zeros(B, self._nx, device=device, dtype=observations.dtype)
         h = network.init_hidden(B, device)
         estimates = []
+        # r_dyn needs f(x_hat_{t-1}); accumulate one f-eval per step t>=1 on the
+        # PREVIOUS estimate, giving the same [B, T-1, nx] stack as f over
+        # x_hat[:, :-1]. r_meas needs h(x_hat_t); accumulate one h-eval per step.
+        f_prev_list = [] if want_dyn else None
+        h_hat_list = [] if want_meas else None
+        x_hat_prev = None
         for t in range(T):
             t_val = ts[t]
             x_pred = torch_f(x, t_val)
@@ -144,35 +176,47 @@ class PINNFilterEstimator(SequentialNeuralFilter):
             dx, h = network.step(innovation, x_pred, h)
             x = x_pred + dx
             estimates.append(x)
-        return torch.stack(estimates, dim=1)  # [B, T, nx]
 
-    def _loss(self, network, observations, states, timestamps, device):
-        import torch
+            # f(x_hat_{t-1}, ts[t-1]): available from step t>=1 onward. Uses the
+            # SAME (state, scalar-t) args as the old post-hoc loop over
+            # x_hat[:, :-1] with ts[k], k=t-1.
+            if want_dyn and x_hat_prev is not None:
+                f_prev_list.append(torch_f(x_hat_prev, ts[t - 1]))
+            # h(x_hat_t, ts[t]): SAME args as the old loop over x_hat with ts[t].
+            if want_meas:
+                h_hat_list.append(torch_h(x, t_val))
+            x_hat_prev = x
+
+        x_hat = torch.stack(estimates, dim=1)  # [B, T, nx]
+        f_prev = torch.stack(f_prev_list, dim=1) if (want_dyn and f_prev_list) else None
+        h_hat = torch.stack(h_hat_list, dim=1) if want_meas else None
+        return x_hat, f_prev, h_hat
+
+    def _loss(self, network, observations, states, timestamps, device, feats_cache=None):
+        # feats_cache is unused: PINN's forward is free-running (each step uses the
+        # net's own previous output), so it is not cacheable. The param exists only
+        # to match the base _loss signature that fit() now calls with feats_cache.
         import torch.nn.functional as F
 
-        torch_f = self._model.torch.f
-        torch_h = self._model.torch.h
-        ts = timestamps.tolist()
-
-        x_hat = self._forward_train(network, observations, states, timestamps, device)  # [B,T,nx]
+        # Fold the r_dyn/r_meas f/h sweeps into the single forward T-loop (Issue
+        # 11). want_* gate exactly on the old lambda!=0 short-circuits so the
+        # ablation baseline (lambda=0) evaluates no extra f/h -- identical work.
+        want_dyn = self._lambda_dyn != 0.0
+        want_meas = self._lambda_meas != 0.0
+        x_hat, f_prev, h_hat = self._forward_train_fused(
+            network, observations, states, timestamps, device,
+            want_dyn=want_dyn, want_meas=want_meas,
+        )
         loss = F.mse_loss(x_hat, states)  # r_data
 
-        # r_dyn: x_hat_t vs f(x_hat_{t-1}, t-1) for t >= 1. f takes a scalar t
-        # per step (nonlinear level uses cos(1.2*t)); stack per-step f calls on
-        # the previous estimate -- cheap, still parallel over B.
-        if self._lambda_dyn != 0.0 and x_hat.shape[1] > 1:
-            prev = x_hat[:, :-1, :]  # [B, T-1, nx]
-            f_prev = torch.stack(
-                [torch_f(prev[:, k, :], ts[k]) for k in range(prev.shape[1])], dim=1
-            )  # [B, T-1, nx]
+        # r_dyn: x_hat_t vs f(x_hat_{t-1}, t-1) for t >= 1. f_prev was built in the
+        # forward loop; identical to the old separate-loop tensor.
+        if want_dyn and x_hat.shape[1] > 1:
             r_dyn = x_hat[:, 1:, :] - f_prev
             loss = loss + self._lambda_dyn * (r_dyn ** 2).mean()
 
         # r_meas: y_t vs h(x_hat_t, t) -- self-supervised (no ground truth).
-        if self._lambda_meas != 0.0:
-            h_hat = torch.stack(
-                [torch_h(x_hat[:, k, :], ts[k]) for k in range(x_hat.shape[1])], dim=1
-            )  # [B, T, ny]
+        if want_meas:
             r_meas = observations - h_hat
             loss = loss + self._lambda_meas * (r_meas ** 2).mean()
 

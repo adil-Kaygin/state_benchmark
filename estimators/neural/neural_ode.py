@@ -63,6 +63,16 @@ class _NeuralODENet:
                 t_col = torch.full((x.shape[0], 1), float(t_val), dtype=x.dtype, device=x.device)
                 return self.drift(torch.cat([x, t_col], dim=1))
 
+            def drift_fn_col(self, x, t_col):
+                """Same as drift_fn but with a PRECOMPUTED time-feature column,
+                so the caller can build t_col once per timestep instead of once
+                per drift eval (Issue 11). t_col must be [B, 1], dtype/device
+                matching x. Numerically identical to drift_fn(x, t_val) for a
+                t_col of full(float(t_val)). The RK4 stages within a step share
+                one t_val, so the same column is reused across all 4*n_substeps
+                evals -- removing ~3000 tiny allocations per batch on Lorenz."""
+                return self.drift(torch.cat([x, t_col], dim=1))
+
             def correct(self, innovation, x_pred):
                 return self.correction(torch.cat([innovation, x_pred], dim=1))
 
@@ -154,11 +164,16 @@ class NeuralODEEstimator(SequentialNeuralFilter):
 
     # --- shared drift assembly (model-drift residual option) -------------
 
-    def _torch_drift(self, network, x, t_val, torch_f):
+    def _torch_drift(self, network, x, t_val, t_col, torch_f):
         """Total drift dx/dt at batched state x and time t_val on the GPU path.
         Pure learned drift by default; with use_model_drift, add the known
-        dynamics as a residual: (f(x) - x)/dt_nominal + g_theta."""
-        learned = network.drift_fn(x, t_val)
+        dynamics as a residual: (f(x) - x)/dt_nominal + g_theta.
+
+        t_col is the precomputed [B, 1] time-feature column for t_val (Issue 11);
+        it is threaded in so the learned drift avoids reallocating it on every
+        one of the 4*n_substeps evals per step. The scalar t_val is still passed
+        for the model-drift `torch_f(x, t_val)` term."""
+        learned = network.drift_fn_col(x, t_col)
         if not self._use_model_drift:
             return learned
         f_x = torch_f(x, t_val)
@@ -166,18 +181,29 @@ class NeuralODEEstimator(SequentialNeuralFilter):
 
     def _rk4_step_torch(self, network, x, t_val, dt, torch_f):
         """One RK4 integration over dt (batched, on device), n_substeps stages."""
+        import torch
         sub_dt = dt / self._n_substeps
+        # Build the time-feature column ONCE for this step: t_val is held constant
+        # across all n_substeps*4 drift evals (the integrator does not advance t
+        # within the step), so the column is identical for every eval. This hoists
+        # ~3000 tiny torch.full allocations/batch out of the inner loop on Lorenz
+        # (Issue 11). Numerically identical to per-eval reconstruction.
+        t_col = torch.full((x.shape[0], 1), float(t_val), dtype=x.dtype, device=x.device)
         for _ in range(self._n_substeps):
-            k1 = self._torch_drift(network, x, t_val, torch_f)
-            k2 = self._torch_drift(network, x + 0.5 * sub_dt * k1, t_val, torch_f)
-            k3 = self._torch_drift(network, x + 0.5 * sub_dt * k2, t_val, torch_f)
-            k4 = self._torch_drift(network, x + sub_dt * k3, t_val, torch_f)
+            k1 = self._torch_drift(network, x, t_val, t_col, torch_f)
+            k2 = self._torch_drift(network, x + 0.5 * sub_dt * k1, t_val, t_col, torch_f)
+            k3 = self._torch_drift(network, x + 0.5 * sub_dt * k2, t_val, t_col, torch_f)
+            k4 = self._torch_drift(network, x + sub_dt * k3, t_val, t_col, torch_f)
             x = x + (sub_dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         return x
 
     # --- GPU batched forward (parallel over B; T loop is intrinsic) ------
 
-    def _forward_train(self, network, observations, states, timestamps, device):
+    def _forward_train(self, network, observations, states, timestamps, device,
+                       feats_cache=None):
+        # feats_cache is unused here: Neural-ODE's per-step f/RK4 depends on the
+        # network's OWN previous output, so it is not cacheable (Issue 11 note);
+        # the param exists only to match the base _loss -> _forward_train call.
         import torch
 
         self._require_torch_dynamics()
