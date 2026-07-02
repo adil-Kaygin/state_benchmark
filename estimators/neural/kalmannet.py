@@ -181,7 +181,6 @@ class KalmanNetEstimator(BaseEstimator):
         min_lr: float = 1e-6,
         early_stopping_patience: Optional[int] = None,
         early_stopping_min_delta: float = 0.0,
-        compile_model: bool = False,
         verbose: bool = True,
     ) -> None:
         self._model = filter_model
@@ -217,10 +216,6 @@ class KalmanNetEstimator(BaseEstimator):
         self._min_lr = min_lr
         self._early_stopping_patience = early_stopping_patience
         self._early_stopping_min_delta = early_stopping_min_delta
-        # Opt-in torch.compile of the Phase-1 teacher-forced parallel forward
-        # (the path where compile actually wins on a real GPU). Never applied to
-        # the per-step / CPU inference path -- compile is a net loss there.
-        self._compile = compile_model
         self._verbose = verbose
         self._network = None
         self._best_val_loss = float("inf")
@@ -335,11 +330,8 @@ class KalmanNetEstimator(BaseEstimator):
         h = network.init_hidden(B, device)
 
         predict_log_var = network.predict_log_var
-        # The free-running path runs network.step EAGER on purpose: it is the
-        # sequential bottleneck and torch.compile is a net loss here (per-step
-        # launch overhead dominates and the train/val grad-mode flip thrashes the
-        # recompile guard). Compile is reserved for the Phase-1 parallel tail
-        # (`_phase1_forward_cached`), where it actually wins on a real GPU.
+        # The free-running path is the sequential bottleneck: per-step launch
+        # overhead dominates, so there is nothing to fuse and it runs eager.
         # Hoist the host read of timestamps out of the T-loop (Issue 12): one
         # tolist() instead of a per-step float(timestamps[t]) scalar extraction
         # (and any host sync if timestamps were on GPU). Numerically identical.
@@ -550,18 +542,6 @@ class KalmanNetEstimator(BaseEstimator):
 
         current_lr = optimizer.param_groups[0]["lr"]
 
-        # Dispatch to the torch.compile'd tail if fit() prepared one, picking the
-        # train/eval variant by grad mode (stable guards, no recompile on the
-        # train/val flip); fall back to the eager method otherwise.
-        def _tail(inp_b, xpred_b, innov_b):
-            if torch.is_grad_enabled():
-                fn = getattr(network, "_compiled_tf_train", None)
-            else:
-                fn = getattr(network, "_compiled_tf_eval", None)
-            if fn is None:
-                return self._phase1_forward_cached(network, inp_b, xpred_b, innov_b, device)
-            return fn(network, inp_b, xpred_b, innov_b, device)
-
         network.train()
         train_loss_total, train_batches = 0.0, 0
         for inp_b, xpred_b, innov_b, states_b in train_loader:
@@ -570,7 +550,7 @@ class KalmanNetEstimator(BaseEstimator):
             innov_b = innov_b.to(device)
             states_b = states_b.to(device)
 
-            pred, log_var = _tail(inp_b, xpred_b, innov_b)
+            pred, log_var = self._phase1_forward_cached(network, inp_b, xpred_b, innov_b, device)
             loss = loss_fn(pred, log_var, states_b)
 
             if not math.isfinite(loss.item()):
@@ -594,7 +574,7 @@ class KalmanNetEstimator(BaseEstimator):
                 xpred_b = xpred_b.to(device)
                 innov_b = innov_b.to(device)
                 states_b = states_b.to(device)
-                pred, log_var = _tail(inp_b, xpred_b, innov_b)
+                pred, log_var = self._phase1_forward_cached(network, inp_b, xpred_b, innov_b, device)
                 val_loss_total += loss_fn(pred, log_var, states_b).item()
                 val_batches += 1
         val_loss = val_loss_total / max(val_batches, 1)
@@ -700,26 +680,6 @@ class KalmanNetEstimator(BaseEstimator):
         torch.manual_seed(self._random_seed)
         device = self._training_device()
         network = self._ensure_network().to(device)
-
-        # Opt-in torch.compile of the Phase-1 teacher-forced tail
-        # (`_phase1_forward_cached`) -- the [B, T, *] GRU+gain graph that survives
-        # after the weight-independent prefix is cached out (Issue 9). This is the
-        # path where compile wins on a real GPU (whole sequence in one graph). We
-        # compile two variants -- one under grad (train), one under no_grad (val) --
-        # and dispatch on torch.is_grad_enabled() so each compiled guard stays
-        # stable and never recompiles when train/val alternate. The free-running
-        # per-step Phase-2 path is left EAGER on purpose (compile is a net loss
-        # there). No-op on torch builds without compile, and cleared before the CPU
-        # inference path. Numerically identical -- compile only fuses kernels.
-        network._compiled_tf_train = None
-        network._compiled_tf_eval = None
-        if self._compile and hasattr(torch, "compile"):
-            try:
-                network._compiled_tf_train = torch.compile(self._phase1_forward_cached)
-                network._compiled_tf_eval = torch.compile(self._phase1_forward_cached)
-            except Exception:
-                network._compiled_tf_train = None
-                network._compiled_tf_eval = None
 
         train_obs = torch.as_tensor(np.asarray(train_dataset.observations), dtype=torch.float32)
         train_states = torch.as_tensor(np.asarray(train_dataset.states), dtype=torch.float32)
@@ -864,13 +824,10 @@ class KalmanNetEstimator(BaseEstimator):
             if phase1_best is not None:
                 network.load_state_dict(phase1_best)
 
-        # Issue 12: move the network to the Phase-2 device BEFORE Phase 2. The
-        # compiled Phase-1 graphs are device-specialized, so drop them first. Any
+        # Issue 12: move the network to the Phase-2 device BEFORE Phase 2. Any
         # Phase-1 best weights were already loaded above (checkpoint clones live on
         # CPU, so that load was device-safe). The fresh Phase-2 optimizer is built
         # inside _run_phase AFTER this move, so Adam's state lands on phase2_device.
-        network._compiled_tf_train = None
-        network._compiled_tf_eval = None
         network.to(phase2_device)
 
         # Phase 2 (free-running): the deployed objective. Starts from Phase 1's
@@ -883,9 +840,6 @@ class KalmanNetEstimator(BaseEstimator):
         if self._best_state_dict is not None:
             network.load_state_dict(self._best_state_dict)
 
-        # Drop the compiled forwards so the CPU inference path uses eager code.
-        network._compiled_tf_train = None
-        network._compiled_tf_eval = None
         self._network = network.to("cpu")
 
     def _run_sequence_sequential_cpu(self, network, observations, timestamps):

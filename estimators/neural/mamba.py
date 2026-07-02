@@ -139,9 +139,13 @@ class _MambaBlock:
                 xz = self.in_proj(u_t)                     # [B, 2*d_inner]
                 x, z = xz.chunk(2, dim=-1)                 # each [B, d_inner]
 
-                # Roll the conv FIFO and apply the depthwise conv at this step.
-                conv_state = torch.roll(conv_state, shifts=-1, dims=-1)
-                conv_state[:, :, -1] = x
+                # Advance the conv FIFO functionally (Issue 15): drop the oldest
+                # column and append x as the newest, via out-of-place concat rather
+                # than roll + in-place index-assign. Bit-identical to the old
+                # [old[1..], x] update, but leaves no in-place mutation for autograd
+                # to trip over, so the differentiable free-running fine-tune can
+                # carry gradient through the conv state across timesteps.
+                conv_state = torch.cat([conv_state[:, :, 1:], x.unsqueeze(-1)], dim=-1)
                 x_conv = torch.sum(
                     conv_state * self.conv1d.weight.squeeze(1), dim=-1
                 ) + self.conv1d.bias
@@ -243,15 +247,24 @@ class MambaEstimator(SequentialNeuralFilter):
     drop-in faster training scan with identical math, but cannot be installed
     here; the plain-torch scan is the implemented path.)
 
-    Training regime (Issues 4 & 13): the selective scan is associative => parallel
-    over T, so the default Phase-1 pass runs the whole [B, T, *] sequence through
-    the scan in one teacher-forced pass (innovation features built from
-    GROUND-TRUTH-prev). Because inference feeds the model's OWN prev estimate,
-    teacher-forced-only training suffers exposure bias, so `curriculum_epochs > 0`
-    adds a FREE-RUNNING fine-tune for the last that-many epochs (Issue 13): a
-    sequential T-loop feeding the model's own x_hat_{t-1} into f/h exactly as
-    `_estimate_sequential_cpu` does, matching train to deployment.
-    curriculum_epochs=0 keeps the fast parallel-scan-only behavior; the
+    Training regime (Issues 4, 13, 15 & 16): the selective scan is associative =>
+    parallel over T, so Phase 1 (teacher-forced warm-start, num_epochs) runs the
+    whole [B, T, *] sequence through the scan in one pass (innovation features
+    built from GROUND-TRUTH-prev). Because inference feeds the model's OWN prev
+    estimate, teacher-forced-only training suffers exposure bias, so
+    `curriculum_epochs > 0` (innovation features only) ADDS Phase 2, a free-running
+    fine-tune of that-many epochs; total epochs = num_epochs + curriculum_epochs
+    (additive, matching KalmanNet, Issue 16). The phases are structurally separate
+    -- each with its own optimizer/scheduler/best-checkpoint/patience -- and fit()
+    loads Phase 2's best weights, so the deployed model is the fine-tuned one, not
+    silently the warm-start.
+
+    Phase 2 drives the fine-tune through the O(T) recurrent `step` path (Issue 15),
+    carrying the constant-size conv FIFO and SSM state one timestep at a time --
+    the SAME math as the parallel scan, at the same cost order as KalmanNet's
+    Phase 2, not the old O(T^2) per-prefix scan rerun. Being launch-bound it
+    defaults to CPU (phase2_device=None; explicit value is the escape hatch).
+    curriculum_epochs=0 keeps the fast parallel-scan-only single phase; the
     raw-[y,dt] branch has no exposure bias so the curriculum is a no-op there.
 
     Hardware split (Issue 0): fit()/val batched on GPU via the parallel scan;
@@ -283,11 +296,11 @@ class MambaEstimator(SequentialNeuralFilter):
         self._n_layers = n_layers
         self._use_innovation_features = use_innovation_features
         self._residual_head = residual_head
-        # Issue 13: trailing epochs trained FREE-RUNNING (own previous estimate)
-        # to close the exposure-bias gap; 0 => parallel-scan teacher-forced only
-        # (previous behavior). No-op with use_innovation_features=False.
+        # Issue 13/16: FREE-RUNNING fine-tune epochs (Phase 2) added AFTER the
+        # num_epochs teacher-forced warm-start (Phase 1); 0 => parallel-scan
+        # teacher-forced only (single phase, previous behavior). No-op with
+        # use_innovation_features=False.
         self._curriculum_epochs = curriculum_epochs
-        self._free_running_phase = False
         # Angular (bearing) observation indices whose innovation must be wrapped
         # to (-pi, pi] before it becomes an input feature (Issues 5/6). Empty for
         # every scalar-observation level -> wrapping is a no-op there.
@@ -300,6 +313,18 @@ class MambaEstimator(SequentialNeuralFilter):
             self._in_features = self._ny + self._ny + self._nx + 1  # [y, innov, x_pred, dt]
         else:
             self._in_features = self._ny + 1                        # [y, dt]
+        # Fail fast (Issue 16) on a curriculum config where a phase would be
+        # silently empty: with the fine-tune on, both the warm-start (num_epochs)
+        # and the fine-tune (curriculum_epochs) budgets must be positive.
+        if curriculum_epochs < 0:
+            raise ValueError(f"{self.estimator_id}: curriculum_epochs must be >= 0.")
+        if use_innovation_features and curriculum_epochs > 0 and self._num_epochs <= 0:
+            raise ValueError(
+                f"{self.estimator_id}: curriculum_epochs={curriculum_epochs} adds a "
+                f"free-running fine-tune phase after the teacher-forced warm-start, "
+                f"but num_epochs={self._num_epochs} leaves that warm-start empty. "
+                f"Set num_epochs > 0 (Issue 16)."
+            )
 
     def _build_network(self):
         return _MambaNet.build(
@@ -320,21 +345,21 @@ class MambaEstimator(SequentialNeuralFilter):
             "curriculum_epochs": self._curriculum_epochs,
         }
 
-    # --- Issue 13: free-running fine-tune to close the exposure-bias gap -----
+    # --- Issue 13/15/16: free-running fine-tune to close the exposure-bias gap -
 
-    def _on_epoch_start(self, epoch: int) -> None:
-        """Enter the free-running phase for the last `curriculum_epochs` epochs
-        (only when innovation features feed state back)."""
-        self._free_running_phase = (
-            self._use_innovation_features
-            and self._curriculum_epochs > 0
-            and epoch >= self._num_epochs - self._curriculum_epochs
-        )
+    def _phase_plan(self):
+        """Teacher-forced parallel-scan warm-start (Phase 1, num_epochs), then --
+        only with the innovation-feature curriculum on -- a free-running fine-tune
+        (Phase 2, curriculum_epochs) on the deployed objective, whose best weights
+        fit() loads last (Issue 16). Off / black-box => single teacher-forced phase.
+        Phase 2 runs on phase2_device (CPU by default, Issue 15)."""
+        if self._use_innovation_features and self._curriculum_epochs > 0:
+            return [(1, self._num_epochs, False), (2, self._curriculum_epochs, True)]
+        return [(1, self._num_epochs, False)]
 
     def _loss(self, network, observations, states, timestamps, device, feats_cache=None):
         """Teacher-forced (parallel scan) MSE during Phase 1; free-running MSE
-        (own previous estimate fed back, matching deployment) during the
-        curriculum tail."""
+        (own previous estimate fed back, matching deployment) during Phase 2."""
         import torch.nn.functional as F
         if self._free_running_phase:
             pred = self._forward_free_running(network, observations, timestamps, device)
@@ -342,6 +367,45 @@ class MambaEstimator(SequentialNeuralFilter):
         return super()._loss(
             network, observations, states, timestamps, device, feats_cache=feats_cache
         )
+
+    def _forward_free_running(self, network, observations, timestamps, device):
+        """Free-running fine-tune via the O(T) recurrent `step` path (Issue 15),
+        replacing the O(T^2) per-prefix scan rerun.
+
+        Carries the per-block conv FIFO and SSM state across timesteps -- exactly
+        the constant-state recurrence `_estimate_sequential_cpu` runs at deployment
+        -- but batched and differentiable, so gradient flows through the fed-back
+        state and the carried state, and retention is linear in T (constant-size
+        state per step). Each step's input features come from the model's OWN
+        previous estimate x_hat_{t-1}, matching inference. Returns x_hat [B, T, nx].
+        """
+        import torch
+
+        B, T, _ = observations.shape
+        use_innov = self._use_innovation_features
+        dt = torch.as_tensor(dt_array(timestamps), dtype=observations.dtype, device=device)
+        if use_innov:
+            self._require_torch_dynamics()
+            torch_f = self._model.torch.f
+            torch_h = self._model.torch.h
+            ts = timestamps.tolist()
+        else:
+            torch_f = torch_h = None
+            ts = [0.0] * T
+
+        x_prev = torch.zeros(B, self._nx, device=device, dtype=observations.dtype)  # own x_hat_{t-1}
+        states = network.init_states(B, device, observations.dtype)
+        x_hats = []
+        for t in range(T):
+            row, x_pred = self._free_running_row(
+                observations[:, t, :], x_prev, dt[t], ts[t],
+                torch_f, torch_h, B, device, observations.dtype,
+            )
+            x_hat, states = network.step(row, x_pred, states)  # constant-state O(1) step
+            x_hats.append(x_hat)
+            x_prev = x_hat                                     # feed own output forward
+
+        return torch.stack(x_hats, dim=1)                      # [B, T, nx]
 
     # --- Issue 9: precompute the weight-independent teacher-forced features ---
 

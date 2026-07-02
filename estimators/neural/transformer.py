@@ -109,19 +109,27 @@ class TransformerEstimator(SequentialNeuralFilter):
     training path (ValueError if None). With use_innovation_features=False the
     Transformer is a pure black-box on raw y and needs no filter_model.torch.
 
-    Training regime (Issues 3 & 13): a causal Transformer is fully parallel over T
-    at training time -- one masked forward pass computes x_hat_t for all t. With
-    innovation features on, the default Phase-1 pass is TEACHER-FORCED: the input
-    x_pred is built from the GROUND-TRUTH previous state (the legitimate parallel
-    teacher-forced INPUT construction). But at inference x_pred comes from the
+    Training regime (Issues 3, 13, 15 & 16): a causal Transformer is fully parallel
+    over T at training time -- one masked forward pass computes x_hat_t for all t.
+    Phase 1 (teacher-forced warm-start, `num_epochs` epochs) builds the input
+    x_pred from the GROUND-TRUTH previous state -- the legitimate parallel
+    teacher-forced INPUT construction. But at inference x_pred comes from the
     model's OWN previous estimate, so a teacher-forced-only model suffers exposure
-    bias (its errors compound on a distribution it never trained on). Set
-    `curriculum_epochs > 0` to add a FREE-RUNNING fine-tune for the last that-many
-    epochs (Issue 13): a sequential T-loop that feeds the model's own x_hat_{t-1}
-    into f/h exactly as `_estimate_sequential_cpu` does, so training matches
-    deployment. curriculum_epochs=0 keeps the fast teacher-forced-only behavior.
-    The raw-[y,dt] branch (use_innovation_features=False) feeds no state back and
-    has no exposure bias, so the curriculum is a no-op there.
+    bias. `curriculum_epochs > 0` (innovation features only) ADDS Phase 2, a
+    free-running fine-tune of that-many epochs on the deployed objective; total
+    epochs = num_epochs + curriculum_epochs (additive, matching KalmanNet, Issue
+    16). The two phases are structurally separate: each owns its optimizer,
+    scheduler, best-checkpoint and patience, and fit() loads Phase 2's best weights
+    -- so the deployed model is the fine-tuned one, never silently the warm-start.
+
+    Phase 2 avoids the old O(T^2)-O(T^3) prefix-rerun (Issue 15) with two-pass
+    scheduled sampling: pass one generates the self-fed features step by step WITH
+    NO GRADIENT (exactly as the CPU inference path does), pass two runs a single
+    differentiable parallel causal forward over those frozen features. Gradient
+    stops at the fed-back state, so retention is one parallel pass, not T of them.
+    curriculum_epochs=0 keeps the fast teacher-forced-only single phase; the
+    raw-[y,dt] branch (use_innovation_features=False) feeds no state back and has
+    no exposure bias, so the curriculum is a no-op there.
 
     Hardware split (Issue 0): fit() is a single parallel [B, T, *] pass on GPU.
     estimate() runs causally one step at a time on CPU -- for each trajectory,
@@ -157,13 +165,13 @@ class TransformerEstimator(SequentialNeuralFilter):
         self._max_len = max_len
         self._use_innovation_features = use_innovation_features
         self._residual_head = residual_head
-        # Issue 13: number of trailing epochs trained FREE-RUNNING (on the model's
-        # own previous estimate) instead of teacher-forced, to close the exposure-
-        # bias gap. 0 => teacher-forced only (previous behavior). Only meaningful
-        # with use_innovation_features=True: the raw-[y,dt] branch feeds no state
-        # back, so it has no exposure bias and this is a no-op there.
+        # Issue 13/16: number of FREE-RUNNING fine-tune epochs (Phase 2) added
+        # AFTER the num_epochs teacher-forced warm-start (Phase 1), to close the
+        # exposure-bias gap. 0 => teacher-forced only (single phase, previous fast
+        # behavior). Only meaningful with use_innovation_features=True: the
+        # raw-[y,dt] branch feeds no state back, so it has no exposure bias and this
+        # is a no-op there.
         self._curriculum_epochs = curriculum_epochs
-        self._free_running_phase = False
         # Angular (bearing) observation indices whose innovation must be wrapped
         # to (-pi, pi] before it becomes an input feature (Issues 5/6). Empty for
         # every scalar-observation level -> wrapping is a no-op there.
@@ -174,6 +182,18 @@ class TransformerEstimator(SequentialNeuralFilter):
         else:
             # [y, dt]
             self._in_features = self._ny + 1
+        # Fail fast (Issue 16) on a curriculum config where a phase would be
+        # silently empty: with the fine-tune on, both the warm-start (num_epochs)
+        # and the fine-tune (curriculum_epochs) budgets must be positive.
+        if curriculum_epochs < 0:
+            raise ValueError(f"{self.estimator_id}: curriculum_epochs must be >= 0.")
+        if use_innovation_features and curriculum_epochs > 0 and self._num_epochs <= 0:
+            raise ValueError(
+                f"{self.estimator_id}: curriculum_epochs={curriculum_epochs} adds a "
+                f"free-running fine-tune phase after the teacher-forced warm-start, "
+                f"but num_epochs={self._num_epochs} leaves that warm-start empty. "
+                f"Set num_epochs > 0 (Issue 16)."
+            )
 
     def _build_network(self):
         return _CausalTransformer.build(
@@ -195,21 +215,30 @@ class TransformerEstimator(SequentialNeuralFilter):
             "curriculum_epochs": self._curriculum_epochs,
         }
 
-    # --- Issue 13: free-running fine-tune to close the exposure-bias gap -----
+    # --- Issue 13/15/16: free-running fine-tune to close the exposure-bias gap -
 
-    def _on_epoch_start(self, epoch: int) -> None:
-        """Enter the free-running phase for the last `curriculum_epochs` epochs
-        (only when innovation features feed state back). Phase-1 warm-start stays
-        teacher-forced and parallel."""
-        self._free_running_phase = (
-            self._use_innovation_features
-            and self._curriculum_epochs > 0
-            and epoch >= self._num_epochs - self._curriculum_epochs
-        )
+    def _phase_plan(self):
+        """Teacher-forced warm-start (Phase 1, num_epochs), then -- only with the
+        innovation-feature curriculum on -- a free-running fine-tune (Phase 2,
+        curriculum_epochs), the deployed objective whose best weights fit() loads
+        last (Issue 16). Off / black-box => single teacher-forced phase."""
+        if self._use_innovation_features and self._curriculum_epochs > 0:
+            return [(1, self._num_epochs, False), (2, self._curriculum_epochs, True)]
+        return [(1, self._num_epochs, False)]
+
+    def _phase_device(self, free_running):
+        """Unlike Mamba's launch-bound step loop, the Transformer's free-running
+        fine-tune is dominated by attention COMPUTE (the no-grad prefix generation
+        plus the one parallel causal pass), which wants the training device. So the
+        fine-tune stays on `device` by default; an explicit phase2_device still
+        overrides it (escape hatch), and the teacher-forced phase is unaffected."""
+        if free_running and self._phase2_device_name is None:
+            return self._training_device()
+        return super()._phase_device(free_running)
 
     def _loss(self, network, observations, states, timestamps, device, feats_cache=None):
         """Teacher-forced MSE during Phase 1; free-running MSE (own previous
-        estimate fed back, matching deployment) during the curriculum tail."""
+        estimate fed back, matching deployment) during Phase 2."""
         import torch.nn.functional as F
         if self._free_running_phase:
             pred = self._forward_free_running(network, observations, timestamps, device)
@@ -217,6 +246,56 @@ class TransformerEstimator(SequentialNeuralFilter):
         return super()._loss(
             network, observations, states, timestamps, device, feats_cache=feats_cache
         )
+
+    def _forward_free_running(self, network, observations, timestamps, device):
+        """Two-pass scheduled sampling (Issue 15), replacing the O(T^2)-O(T^3)
+        differentiable prefix-rerun.
+
+        Pass 1 (NO GRADIENT) generates the self-fed input features step by step,
+        feeding the model's OWN previous estimate x_hat_{t-1} into f/h exactly as
+        `_estimate_sequential_cpu` does at deployment, and re-running the causal
+        forward on the growing prefix to get each x_hat_t. It fills a preallocated
+        [B, T, *] buffer (no per-step re-stack of the whole prefix), so the only
+        retained tensors are the frozen features -- no autograd graph is built.
+
+        Pass 2 (DIFFERENTIABLE) runs the existing single parallel causal-masked
+        forward over those frozen features and returns x_hat, so the loss is taken
+        there. Gradient flows through the network weights but stops at the fed-back
+        state (a constant here) -- the standard scheduled-sampling construction --
+        so retention is exactly one parallel pass while the inputs match the
+        deployment distribution. Returns x_hat [B, T, nx]."""
+        import torch
+
+        B, T, _ = observations.shape
+        use_innov = self._use_innovation_features
+        dt = torch.as_tensor(dt_array(timestamps), dtype=observations.dtype, device=device)
+        if use_innov:
+            self._require_torch_dynamics()
+            torch_f = self._model.torch.f
+            torch_h = self._model.torch.h
+            ts = timestamps.tolist()
+        else:
+            torch_f = torch_h = None
+            ts = [0.0] * T
+
+        feats_buf = torch.zeros(B, T, self._in_features, device=device, dtype=observations.dtype)
+        xpred_buf = torch.zeros(B, T, self._nx, device=device, dtype=observations.dtype)
+        x_prev = torch.zeros(B, self._nx, device=device, dtype=observations.dtype)  # own x_hat_{t-1}
+
+        with torch.no_grad():
+            for t in range(T):
+                row, x_pred = self._free_running_row(
+                    observations[:, t, :], x_prev, dt[t], ts[t],
+                    torch_f, torch_h, B, device, observations.dtype,
+                )
+                feats_buf[:, t, :] = row
+                xpred_buf[:, t, :] = x_pred
+                # Honest no-KV-cache deployment cost: rerun the prefix each step.
+                x_hat_seq = network(feats_buf[:, : t + 1, :], xpred_buf[:, : t + 1, :])
+                x_prev = x_hat_seq[:, -1, :]  # own output feeds the next step
+
+        # Pass 2: one differentiable parallel pass over the frozen self-fed feats.
+        return network(feats_buf, xpred_buf)
 
     # --- Issue 9: precompute the weight-independent teacher-forced features ---
 

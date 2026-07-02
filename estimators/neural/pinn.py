@@ -138,36 +138,40 @@ class PINNFilterEstimator(SequentialNeuralFilter):
 
     def _forward_train_fused(self, network, observations, states, timestamps,
                              device, want_dyn, want_meas):
-        """Single-pass forward that ALSO folds the physics residuals into the one
-        T-loop it already runs (Issue 11), instead of two extra standalone
-        T-loops in `_loss`. Returns (x_hat [B,T,nx], f_prev or None, h_hat or None):
+        """Single-pass forward returning (x_hat [B,T,nx], f_prev or None, h_hat or
+        None) for the physics residuals:
 
-          f_prev[:, t-1] = f(x_hat_{t-1}, ts[t-1])   for t = 1..T-1  (want_dyn)
-          h_hat[:, t]    = h(x_hat_t,     ts[t])      for t = 0..T-1  (want_meas)
+          f_prev[:, k] = f(x_hat_k, ts[k])   for k = 0..T-2   (want_dyn)
+          h_hat[:, t]  = h(x_hat_t, ts[t])   for t = 0..T-1   (want_meas)
 
-        These are exactly the tensors the old `_loss` built in its separate loops
-        (`f_prev` = f over x_hat[:, :-1]; `h_hat` = h over x_hat), so the derived
-        r_dyn/r_meas and the loss are numerically identical -- only the loop
-        structure changed. When a want_* flag is False (the lambda==0 ablation)
-        that residual's f/h is never evaluated, matching the old short-circuit.
+        The T-loop's only irreducible content is the recursion itself (predict from
+        the previous estimate, form the innovation, step the GRU, feed x_hat back);
+        the residual f/h are NOT part of that recursion -- their inputs are the
+        estimates the loop already materializes -- so they are evaluated AFTER the
+        loop over the stacked x_hat (Issue 18), not 2T times inside it.
+
+        On a `time_invariant` level (f/h ignore the scalar t -- linear, pendulum,
+        Lorenz, vehicle-tracking) each residual collapses to ONE flattened [B*T]
+        call, exactly the collapse `precompute_teacher_forced` performs; the
+        representative ts[0] is ignored by construction. On a time-varying level
+        the per-step scalar t matters, so a stacked per-step evaluation is kept
+        (still outside the recursion loop). Either way the values equal the old
+        in-loop accumulation bit-for-bit, so r_dyn/r_meas and the loss are
+        unchanged; the want_* gates keep skipping a lambda==0 residual entirely.
         """
         import torch
 
         self._require_torch_dynamics()
         torch_f = self._model.torch.f
         torch_h = self._model.torch.h
+        time_invariant = self._model.torch.time_invariant
         B, T, _ = observations.shape
         ts = timestamps.tolist()
 
+        # Irreducible recursion loop: each step uses the net's own previous output.
         x = torch.zeros(B, self._nx, device=device, dtype=observations.dtype)
         h = network.init_hidden(B, device)
         estimates = []
-        # r_dyn needs f(x_hat_{t-1}); accumulate one f-eval per step t>=1 on the
-        # PREVIOUS estimate, giving the same [B, T-1, nx] stack as f over
-        # x_hat[:, :-1]. r_meas needs h(x_hat_t); accumulate one h-eval per step.
-        f_prev_list = [] if want_dyn else None
-        h_hat_list = [] if want_meas else None
-        x_hat_prev = None
         for t in range(T):
             t_val = ts[t]
             x_pred = torch_f(x, t_val)
@@ -176,20 +180,28 @@ class PINNFilterEstimator(SequentialNeuralFilter):
             dx, h = network.step(innovation, x_pred, h)
             x = x_pred + dx
             estimates.append(x)
-
-            # f(x_hat_{t-1}, ts[t-1]): available from step t>=1 onward. Uses the
-            # SAME (state, scalar-t) args as the old post-hoc loop over
-            # x_hat[:, :-1] with ts[k], k=t-1.
-            if want_dyn and x_hat_prev is not None:
-                f_prev_list.append(torch_f(x_hat_prev, ts[t - 1]))
-            # h(x_hat_t, ts[t]): SAME args as the old loop over x_hat with ts[t].
-            if want_meas:
-                h_hat_list.append(torch_h(x, t_val))
-            x_hat_prev = x
-
         x_hat = torch.stack(estimates, dim=1)  # [B, T, nx]
-        f_prev = torch.stack(f_prev_list, dim=1) if (want_dyn and f_prev_list) else None
-        h_hat = torch.stack(h_hat_list, dim=1) if want_meas else None
+
+        # r_dyn: f applied to every estimate except the last (x_hat_{t-1} for the
+        # t=1..T-1 residual). Differentiable through the stacked x_hat.
+        f_prev = None
+        if want_dyn and T > 1:
+            src = x_hat[:, :-1, :]  # [B, T-1, nx]
+            if time_invariant:
+                f_prev = torch_f(src.reshape(B * (T - 1), self._nx), ts[0]).reshape(B, T - 1, -1)
+            else:
+                f_prev = torch.stack(
+                    [torch_f(x_hat[:, k, :], ts[k]) for k in range(T - 1)], dim=1
+                )
+        # r_meas: h applied to every estimate.
+        h_hat = None
+        if want_meas:
+            if time_invariant:
+                h_hat = torch_h(x_hat.reshape(B * T, self._nx), ts[0]).reshape(B, T, -1)
+            else:
+                h_hat = torch.stack(
+                    [torch_h(x_hat[:, t, :], ts[t]) for t in range(T)], dim=1
+                )
         return x_hat, f_prev, h_hat
 
     def _loss(self, network, observations, states, timestamps, device, feats_cache=None):
@@ -198,9 +210,10 @@ class PINNFilterEstimator(SequentialNeuralFilter):
         # to match the base _loss signature that fit() now calls with feats_cache.
         import torch.nn.functional as F
 
-        # Fold the r_dyn/r_meas f/h sweeps into the single forward T-loop (Issue
-        # 11). want_* gate exactly on the old lambda!=0 short-circuits so the
-        # ablation baseline (lambda=0) evaluates no extra f/h -- identical work.
+        # The r_dyn/r_meas f/h sweeps are evaluated once, after the recursion loop,
+        # over the stacked estimates -- flattened to one call on time_invariant
+        # levels (Issue 18). want_* gate exactly on the old lambda!=0 short-circuits
+        # so the ablation baseline (lambda=0) evaluates no extra f/h.
         want_dyn = self._lambda_dyn != 0.0
         want_meas = self._lambda_meas != 0.0
         x_hat, f_prev, h_hat = self._forward_train_fused(
@@ -209,8 +222,8 @@ class PINNFilterEstimator(SequentialNeuralFilter):
         )
         loss = F.mse_loss(x_hat, states)  # r_data
 
-        # r_dyn: x_hat_t vs f(x_hat_{t-1}, t-1) for t >= 1. f_prev was built in the
-        # forward loop; identical to the old separate-loop tensor.
+        # r_dyn: x_hat_t vs f(x_hat_{t-1}, t-1) for t >= 1. f_prev is the post-loop
+        # residual tensor; identical values to the old in-loop accumulation.
         if want_dyn and x_hat.shape[1] > 1:
             r_dyn = x_hat[:, 1:, :] - f_prev
             loss = loss + self._lambda_dyn * (r_dyn ** 2).mean()

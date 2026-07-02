@@ -11,14 +11,11 @@ setup(
         "torch>=2.0",
         "matplotlib>=3.7",
         "comet_ml>=3.0",
-        "torch-kf>=0.2",
-        "torchfilter>=0.0.1",
+        "torch-kf",
+        "torchfilter",
     ],
     extras_require={
-        "dev": [
-            "pytest>=7.0",
-            "psutil>=5.9",
-        ],
+
         "fast": [
             "numba>=0.58",
         ],
