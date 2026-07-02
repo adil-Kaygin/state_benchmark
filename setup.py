@@ -12,8 +12,7 @@ setup(
         "matplotlib>=3.7",
         "comet_ml>=3.0",
         "torch-kf",
-        "torchfilter",
-    ],
+        "torchfilter @ git+https://github.com/stanford-iprl-lab/torchfilter.git",    ],
     extras_require={
 
         "fast": [
