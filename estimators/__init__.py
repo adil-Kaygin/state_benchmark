@@ -3,7 +3,12 @@ from .classical.kf import KalmanFilterEstimator
 from .classical.ekf import EKFEstimator
 from .classical.ukf import UKFEstimator
 from .classical.pf import ParticleFilterEstimator
-from .classical.filterpy_filters import FilterpyKFEstimator, FilterpyEKFEstimator, FilterpyUKFEstimator
+from .classical.torchkf_filters import (
+    TorchKFKFEstimator,
+    TorchKFEKFEstimator,
+    TorchKFUKFEstimator,
+    TorchKFPFEstimator,
+)
 from .neural.kalmannet import KalmanNetEstimator, KalmanNetUncertaintyEstimator
 from .neural.neural_ode import NeuralODEEstimator
 from .neural.pinn import PINNFilterEstimator
@@ -28,16 +33,20 @@ ESTIMATORS = {
 # Opt-in estimators not run by the default benchmark notebook.
 EXPERIMENTAL_ESTIMATORS = {
     "kalmannet_uncertainty": KalmanNetUncertaintyEstimator,
+    "torchkf_pf": TorchKFPFEstimator,  # torchfilter particle filter, for future use
 }
 
-# filterpy-backed re-implementations of kf/ekf/ukf, used as an independent
-# cross-check against this repo's custom NumPy/Numba filters. Importing these
-# classes never requires filterpy to be installed; only instantiating one
-# does (see filterpy_filters._require_filterpy).
+# torch-kf / torchfilter-backed re-implementations of kf/ekf/ukf, used as an
+# independent cross-check against this repo's custom NumPy/Numba filters. The KF
+# is backed by torch-kf (linear-only); the EKF/UKF by torchfilter. Importing
+# these classes never requires either package to be installed; only instantiating
+# one does (see torchkf_filters._require_torchkf / _require_torchfilter).
+# torchkf_pf (torchfilter's particle filter) is added for future use and lives in
+# EXPERIMENTAL_ESTIMATORS, not here -- it reports point estimates only.
 REFERENCE_ESTIMATORS = {
-    "filterpy_kf": FilterpyKFEstimator,
-    "filterpy_ekf": FilterpyEKFEstimator,
-    "filterpy_ukf": FilterpyUKFEstimator,
+    "torchkf_kf": TorchKFKFEstimator,
+    "torchkf_ekf": TorchKFEKFEstimator,
+    "torchkf_ukf": TorchKFUKFEstimator,
 }
 
 __all__ = [
@@ -46,9 +55,10 @@ __all__ = [
     "EKFEstimator",
     "UKFEstimator",
     "ParticleFilterEstimator",
-    "FilterpyKFEstimator",
-    "FilterpyEKFEstimator",
-    "FilterpyUKFEstimator",
+    "TorchKFKFEstimator",
+    "TorchKFEKFEstimator",
+    "TorchKFUKFEstimator",
+    "TorchKFPFEstimator",
     "KalmanNetEstimator",
     "KalmanNetUncertaintyEstimator",
     "NeuralODEEstimator",

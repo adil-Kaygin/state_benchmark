@@ -11,7 +11,8 @@ setup(
         "torch>=2.0",
         "matplotlib>=3.7",
         "comet_ml>=3.0",
-        "filterpy>=1.4",
+        "torch-kf>=0.2",
+        "torchfilter>=0.0.1",
     ],
     extras_require={
         "dev": [

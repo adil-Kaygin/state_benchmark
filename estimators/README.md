@@ -29,8 +29,8 @@ KalmanNet's GPU training.
   `ValueError` on a nonlinear model, so it is never swept there).
 - `EXPERIMENTAL_ESTIMATORS` — opt-in: `kalmannet_uncertainty`, `neural_ode`,
   `transformer`.
-- `REFERENCE_ESTIMATORS` — third-party cross-checks: `filterpy_kf`,
-  `filterpy_ekf`, `filterpy_ukf`.
+- `REFERENCE_ESTIMATORS` — third-party cross-checks: `torchkf_kf`,
+  `torchkf_ekf`, `torchkf_ukf`.
 
 ## classical/kf.py — `KalmanFilterEstimator`
 
@@ -182,22 +182,41 @@ update:                           xₜ = x⁻ₜ + Kₜ eₜ
     simulates microprocessor/embedded deployment and measures inference latency
     under that condition, not under GPU batch throughput.
 
-## classical/filterpy_filters.py — `FilterpyKFEstimator`, `FilterpyEKFEstimator`, `FilterpyUKFEstimator`
+## classical/torchkf_filters.py — `TorchKFKFEstimator`, `TorchKFEKFEstimator`, `TorchKFUKFEstimator`, `TorchKFPFEstimator`
 
-Reference re-implementations of KF/EKF/UKF on top of the third-party
-[`filterpy`](https://github.com/rlabbe/filterpy) library, used as an independent
-cross-check against this repo's custom Numba filters — same `FilterModel`
-contract, same linearization behavior as their custom counterparts (KF
-linearizes once at the origin -- valid only on a linear model, same as the
-strict `KalmanFilterEstimator` -- EKF re-linearizes every step, UKF uses
-`MerweScaledSigmaPoints` with the same `alpha=1e-3, beta=2.0, kappa=0.0`).
-`FilterpyKFEstimator` has no `assert_linear_model` guard of its own; only run it
-on `LinearBenchmark`. On that level, its RMSE should match
-`KalmanFilterEstimator`'s up to floating-point noise.
+Reference re-implementations of KF/EKF/UKF (and a PF, for future use) built on
+two third-party PyTorch libraries, used as an independent cross-check against
+this repo's custom Numba filters — same `FilterModel` contract, same
+linearization behavior as their custom counterparts (KF linearizes once at the
+origin -- valid only on a linear model, same as the strict
+`KalmanFilterEstimator` -- EKF re-linearizes every step, UKF uses the Merwe
+scaled sigma points with the same `alpha=1e-3, beta=2.0, kappa=0.0`):
 
-`filterpy` is imported lazily (only when one of these classes is instantiated;
-`_require_filterpy()` raises a clear `ImportError` if it is missing), so the rest
-of the package works without it installed. Registered in `REFERENCE_ESTIMATORS`.
+- **KF** → [`torch-kf`](https://github.com/raphaelreme/torch-kf) (imported as
+  `torch_kf`), a natively-batched **linear** Kalman `predict`/`update` over a
+  `GaussianState`. Every trajectory is filtered in one batched pass.
+- **EKF / UKF / PF** → [`torchfilter`](https://github.com/stanford-iprl-lab/torchfilter),
+  which supplies `ExtendedKalmanFilter`, `UnscentedKalmanFilter`
+  (`MerweSigmaPointStrategy`), and `ParticleFilter`. torch-kf is linear-only, so
+  the nonlinear filters come from torchfilter. The dynamics/measurement models
+  wrap the level's `f`/`h` and return the analytic Jacobians `F`/`H` directly
+  (our `f`/`h` are NumPy, not torch-differentiable), and thread the per-step
+  timestamp through a mutable `t` on the dynamics model. For angular levels the
+  bearing innovation is wrapped to `(-π, π]` by substituting
+  `obs' = h(x_pred) + wrap(obs - h(x_pred))` before torchfilter's update step
+  (Issues 5/6).
+
+`TorchKFKFEstimator` has no `assert_linear_model` guard of its own; only run it
+on `LinearBenchmark`, where its RMSE should match `KalmanFilterEstimator`'s up to
+floating-point noise. `TorchKFPFEstimator` is registered in
+`EXPERIMENTAL_ESTIMATORS` (not the default sweep) and reports point estimates
+only (`returns_covariance` is False), so it is excluded from the NEES/NLL table
+until a particle-covariance estimate is wired up.
+
+Both libraries are imported lazily (only when a class that needs them is
+instantiated; `_require_torchkf()` / `_require_torchfilter()` raise a clear
+`ImportError` if missing), so the rest of the package works without either
+installed. The KF/EKF/UKF are registered in `REFERENCE_ESTIMATORS`.
 
 ## neural/neural_ode.py, neural/transformer.py
 

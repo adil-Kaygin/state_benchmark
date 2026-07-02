@@ -29,7 +29,7 @@ path at all — the NumPy fallbacks and the linear-only fast UKF path were delet
 so there is a single implementation per filter (the `@njit` kernel) and nothing
 to drift out of parity. What remains is the level dynamics being written twice
 (Python `f/h/F/H` in each level **and** their `@njit`/torch mirrors in
-`_numba_dynamics.py` / `_torch_dynamics.py`), plus the custom-vs-`filterpy`
+`_numba_dynamics.py` / `_torch_dynamics.py`), plus the custom-vs-`torch-kf`/`torchfilter`
 cross-check. There is still no automated parity script (the project does not keep
 a `tests/` dir), so keeping those mirrors in sync remains a manual discipline; a
 standalone parity script on `LinearBenchmark` would close the gap.
@@ -81,7 +81,7 @@ structure suggests.
 | # | Issue | Tag | Where |
 |---|-------|-----|-------|
 | 1 | KF-on-nonlinear: origin linearization, NumPy path unguarded | resolved (KF refuses nonlinear; NumPy path deleted) | kf.py |
-| 2 | Numba/NumPy & custom/filterpy parity untested | largely resolved (no dual filter path); dynamics mirrors still manual | _numba_kernels.py |
+| 2 | Numba/NumPy & custom/torchfilter parity untested | largely resolved (no dual filter path); dynamics mirrors still manual | _numba_kernels.py |
 | 3 | EKF uses Euler-order Jacobian on RK4 Lorenz | resolved (exact RK4 Jacobian) | (cross-ref) lorenz.py |
 | 4 | KalmanNet predict is per-row NumPy loop | resolved for training (batched torch GPU); inference CPU-sequential by design | kalmannet.py |
 | 5 | `load()` cannot rebuild a FilterModel | valid-as-is | classical/neural `load` |

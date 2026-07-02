@@ -9,7 +9,7 @@ hot inner loops live next to each other for easy comparison/maintenance.
 
 Numba is a HARD dependency of the classical filters. There is no pure-NumPy
 fallback: the entire benchmark relies exclusively on these @njit kernels (plus
-the third-party filterpy reference filters). Per the "fail fast and loud"
+the third-party torch-kf/torchfilter reference filters). Per the "fail fast and loud"
 architectural rule, if numba is missing or fails to import, this module raises
 ImportError at import time rather than silently degrading to slow/divergent
 NumPy code.
@@ -89,7 +89,8 @@ def angular_mask_float(filter_model, ny: int) -> np.ndarray:
     """Build the float [ny] angular-observation mask (1.0 where a component is an
     angle to wrap, else 0.0) from FilterModel.angular_obs_mask, defaulting to
     all-zeros (no wrapping) for the scalar-observation levels. Kept here so
-    EKF/UKF (custom and filterpy) all derive the mask identically.
+    EKF/UKF (custom and the torch-kf/torchfilter references) all derive the mask
+    identically.
 
     Raises ValueError if a provided mask has the wrong length -- a mislabelled
     mask that silently wraps the wrong (or no) component is exactly the footgun

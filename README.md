@@ -26,7 +26,7 @@ These are enforced in code, not just conventions:
   mismatched arrays, or a scientifically unsound configuration raise a
   descriptive `ValueError`/`RuntimeError`/`ImportError` immediately.
 - **Strict Numba.** The classical filters (KF/EKF/UKF) run *exclusively* on the
-  custom `@njit` kernels (plus the third-party `filterpy` reference filters).
+  custom `@njit` kernels (plus the third-party `torch-kf` reference filters).
   There is no pure-NumPy fallback; a missing numba raises `ImportError` at
   import time.
 - **Linear KF only on linear models.** `KalmanFilterEstimator` asserts its model
@@ -58,7 +58,7 @@ module directly):
   `y_t=h(x_t)+v_t` for linear / nonlinear / pendulum / lorenz (+ `lorenz_fea`,
   the forward-Euler-Jacobian baseline).
 - [estimators/README.md](estimators/README.md) — KF/EKF/UKF/PF update equations,
-  KalmanNet's learned-gain formulation, filterpy reference filters.
+  KalmanNet's learned-gain formulation, torch-kf reference filters.
 - [metrics/README.md](metrics/README.md) — per-variable RMSE, NEES/NLL,
   latency/runtime formulas.
 - [visualization/README.md](visualization/README.md) — plot ↔ metric/array contract.
